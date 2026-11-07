@@ -75,6 +75,11 @@ stream with a `tool_request` event that lists the calls. The CLI runs them and s
 results back as `tool_results` (instead of a `prompt`) on the same thread, so the model
 continues where it stopped.
 
+Tools that SynapseAPI runs itself, such as web search (enabled with `/web`), don't pause
+the model, so there's no `tool_request` for them. Instead SynapseAPI sends `tool_start`
+and `tool_end` events, which the CLI shows between the reply's text, for example
+`⟳ web search: <query>`, so you can see what the model is looking up.
+
 ## Running commands
 
 The model can ask to run shell commands on your machine through its `bash` tool. Each

@@ -83,7 +83,7 @@ def test_warns_at_startup_when_sandbox_is_unavailable(monkeypatch, console, fake
 def test_line_is_drawn_above_every_prompt(monkeypatch, console, fake_api):
     output, prompt = run(monkeypatch, console, ["/help", "exit"])
 
-    rules = [line for line in output.splitlines() if set(line) == {"─"}]
+    rules = [line for line in output.splitlines() if set(line) == {"\u2500"}]
     assert len(rules) == len(prompt.prompts) == 2
     assert output.rstrip().splitlines()[-2] == rules[-1]
 
@@ -98,7 +98,7 @@ def test_greets_user_and_lists_providers_only(monkeypatch, console, fake_api):
     for model in ("gpt-a", "gpt-b", "claude-a"):
         assert model not in output
     assert (
-        "Commands: /provider <name>, /model <name>, /new, /clear, /help. "
+        "Commands: /provider <name>, /model <name>, /new, /clear, /help, /web. "
         "Type /help for details."
     ) in output
 
@@ -169,6 +169,30 @@ def test_prompt_shows_current_selection(monkeypatch, console, fake_api):
     assert "gpt-a" in provider_and_model
 
 
+def test_prompt_shows_web_badge_only_while_web_search_is_on(
+    monkeypatch, console, fake_api
+):
+    _, fake_prompt = run(monkeypatch, console, ["/web", "/web", "exit"])
+
+    before, enabled, disabled = fake_prompt.prompts
+    assert "web" not in before
+    assert "✓ web" in enabled
+    assert "web" not in disabled
+
+
+def test_prompt_shows_web_badge_after_selection(monkeypatch, console, fake_api):
+    _, fake_prompt = run(monkeypatch, console, [*SELECT_MODEL, "/web", "exit"])
+
+    prompt = fake_prompt.prompts[-1]
+    assert prompt.index("gpt-a") < prompt.index("✓ web")
+
+
+def test_web_search_setting_is_sent_with_input(monkeypatch, console, fake_api):
+    run(monkeypatch, console, [*SELECT_MODEL, "/web", "hello", "exit"])
+
+    assert fake_api["stream_response"].call_args.kwargs["web_search"] is True
+
+
 # --- Regular input -----------------------------------------------------------
 
 
@@ -182,6 +206,7 @@ def test_input_is_streamed_to_selected_model(monkeypatch, console, fake_api):
         model_name="gpt-a",
         thread_id=None,
         tool_results=None,
+        web_search=False,
     )
 
 

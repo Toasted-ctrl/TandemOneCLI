@@ -26,9 +26,9 @@ COMMANDS: tuple[CommandInfo, ...] = (
     CommandInfo("/new", "Start a new conversation; the model forgets earlier messages"),
     CommandInfo("/clear", "Clear the selected provider and model"),
     CommandInfo("/help", "Show this help"),
+    CommandInfo("/web", "Toggle web search for the model on or off"),
 )
 
-# Not a slash command, but listed in the detailed help so it's easy to find
 EXIT_COMMAND = CommandInfo("exit", "Quit Tandem One CLI (or press Ctrl+C)")
 
 
@@ -46,8 +46,9 @@ class SlashState:
 
     selected_provider: Optional[str] = None
     selected_model: Optional[str] = None
-    # ID of the current conversation; None means the next message starts a new one
     thread_id: Optional[str] = None
+    # Whether the model may search the web; shown next to the prompt when on
+    web: bool = False
 
 
 @dataclass
@@ -103,6 +104,9 @@ class SlashHandler:
 
         elif command == "help":
             return self._handle_help()
+
+        elif command == "web":
+            return self._handle_web_search()
 
         else:
             return CommandResponse(
@@ -182,3 +186,10 @@ class SlashHandler:
     def _handle_help(self) -> CommandResponse:
         """Handle /help command."""
         return CommandResponse(self.get_detailed_help())
+
+    def _handle_web_search(self) -> CommandResponse:
+        """Handle /web command: toggle web search on or off."""
+        self.state.web = not self.state.web
+        if self.state.web:
+            return CommandResponse("[bold green]✓ Web search enabled[/bold green]")
+        return CommandResponse("[dim]Web search disabled[/dim]")

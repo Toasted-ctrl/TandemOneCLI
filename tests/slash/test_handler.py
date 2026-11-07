@@ -334,3 +334,20 @@ def test_help_does_not_change_state(handler):
 
 def test_bullet_list_strips_control_chars():
     assert bullet_list(["gpt\x1b[2J"]) == "  • gpt[2J"
+
+
+# --- /web --------------------------------------------------------------------
+
+
+def test_web_search_is_off_by_default(handler):
+    assert handler.state.web is False
+
+
+def test_web_toggles_web_search(handler):
+    enabled = handler.handle("/web")
+    assert handler.state.web is True
+    assert "enabled" in enabled.message
+
+    disabled = handler.handle("/web")
+    assert handler.state.web is False
+    assert "disabled" in disabled.message

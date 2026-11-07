@@ -114,6 +114,14 @@ class MarkdownPrinter:
             self._print(self._pending)
         self._pending = ""
 
+    def pause(self) -> None:
+        """Print what's pending, so other output can be shown before more chunks.
+
+        The reply simply continues when ``add`` is called again; what was printed
+        stays on screen with a blank line between it and what follows.
+        """
+        self.finish()
+
     def _render(self, text: str) -> RenderableType:
         markdown = Markdown(text.strip("\n"), hyperlinks=False)
         # Leave a blank line between blocks, as Markdown does, unless Rich adds one

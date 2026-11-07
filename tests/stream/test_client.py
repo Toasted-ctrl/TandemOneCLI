@@ -8,10 +8,12 @@ from rich.markdown import Markdown
 
 from tandemonecli.stream import client
 from tandemonecli.stream.client import (
+    ServerToolActivity,
     ToolCall,
     ToolResult,
     _is_invalid_thread,
     extract_content,
+    extract_server_tools,
     extract_tool_calls,
     iter_content,
     iter_events,
@@ -192,6 +194,7 @@ def test_stream_response_sends_expected_request(monkeypatch, console):
             "model": {"provider": "openai", "name": "kimi-k3"},
             "system_prompt": client.SYSTEM_PROMPT,
             "client_tools": [client.BASH_TOOL_SPEC],
+            "tools": {"web_search": False},
             "prompt": "hello",
         },
         stream=True,
@@ -808,3 +811,194 @@ def test_waiting_for_tool_results_is_explained(monkeypatch, console):
     assert result.thread_id == THREAD_A
     assert "still waiting for the result of a command" in output
     assert "/new" in output
+
+
+# --- Server-side tools -------------------------------------------------------
+# Shaped like SynapseAPI's "update" events: each finished agent step with its
+# messages, serialized with LangChain's model_dump()
+
+
+def ai_message(*tool_calls: dict) -> dict:
+    return {"type": "ai", "content": "", "tool_calls": list(tool_calls)}
+
+
+def tool_call(name: str, args: dict, call_id: str = "call_1") -> dict:
+    return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
+
+
+def tool_message(name: str, content: str = "ok", status: str = "success") -> dict:
+    return {
+        "type": "tool",
+        "name": name,
+        "content": content,
+        "tool_call_id": "call_1",
+        "status": status,
+    }
+
+
+def update_event(step: str, *messages: dict) -> list[str]:
+    payload = {"type": "update", "data": {step: {"messages": list(messages)}}}
+    return [f"data: {json.dumps(payload)}", ""]
+
+
+SCRAPE_CALL = tool_call("firecrawl_scrape", {"url": "https://docs.example.com"})
+
+
+def test_shows_server_tool_call_and_result(monkeypatch, console):
+    fake_post(
+        monkeypatch,
+        [
+            *sse_lines("Let me look that up."),
+            *update_event("model", ai_message(SCRAPE_CALL)),
+            *update_event("tools", tool_message("firecrawl_scrape")),
+            *sse_lines("Found it."),
+        ],
+    )
+
+    stream_response("key", "hi", "openai", "kimi-k3", web_search=True)
+
+    text = output(console)
+    started = "⟳ firecrawl scrape https://docs.example.com"
+    assert started in text
+    assert "✓ firecrawl scrape" in text
+    assert text.index("Let me look that up.") < text.index(started)
+    assert text.index(started) < text.index("✓ firecrawl scrape")
+    assert text.index("✓ firecrawl scrape") < text.index("Found it.")
+
+
+def test_shows_failed_server_tool_with_reason(monkeypatch, console):
+    fake_post(
+        monkeypatch,
+        update_event(
+            "tools",
+            tool_message(
+                "firecrawl_scrape",
+                "Tool 'firecrawl_scrape' failed with error: timeout\ntraceback",
+                status="error",
+            ),
+        ),
+    )
+
+    stream_response("key", "hi", "openai", "kimi-k3", web_search=True)
+
+    text = output(console)
+    assert "✗ firecrawl scrape failed: Tool 'firecrawl_scrape' failed" in text
+    assert "timeout" in text
+    assert "traceback" not in text
+
+
+def test_client_tool_calls_are_not_shown_as_server_tools(monkeypatch, console):
+    fake_post(
+        monkeypatch,
+        [
+            *update_event("model", ai_message(tool_call("bash", {"command": "ls"}))),
+            *update_event("tools", tool_message("bash")),
+        ],
+    )
+
+    stream_response("key", "hi", "openai", "kimi-k3")
+
+    text = output(console)
+    assert "⟳" not in text
+    assert "✓" not in text
+
+
+def test_server_tool_names_and_details_escape_markup(monkeypatch, console):
+    fake_post(
+        monkeypatch,
+        update_event(
+            "model",
+            ai_message(tool_call("web_[bold]search", {"query": "[red]x[/red]"})),
+        ),
+    )
+
+    stream_response("key", "hi", "openai", "kimi-k3")
+
+    assert "⟳ web [bold]search [red]x[/red]" in output(console)
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            {
+                "type": "update",
+                "data": {"model": {"messages": [ai_message(SCRAPE_CALL)]}},
+            },
+            [
+                ServerToolActivity(
+                    "firecrawl_scrape", "started", "https://docs.example.com"
+                )
+            ],
+        ),
+        (
+            {
+                "type": "update",
+                "data": {"tools": {"messages": [tool_message("firecrawl_map")]}},
+            },
+            [ServerToolActivity("firecrawl_map", "success")],
+        ),
+        # Several calls in one step
+        (
+            {
+                "type": "update",
+                "data": {
+                    "model": {
+                        "messages": [
+                            ai_message(
+                                tool_call("search", {"query": "a"}),
+                                tool_call("crawl", {"urls": ["x", "y"]}),
+                            )
+                        ]
+                    }
+                },
+            },
+            [
+                ServerToolActivity("search", "started", "a"),
+                ServerToolActivity("crawl", "started", "x, y"),
+            ],
+        ),
+        # Other inputs are shown as JSON
+        (
+            {
+                "type": "update",
+                "data": {"m": {"messages": [ai_message(tool_call("t", {"n": 1}))]}},
+            },
+            [ServerToolActivity("t", "started", '{"n": 1}')],
+        ),
+        # Client tools, replies without tool calls and malformed data are skipped
+        (
+            {
+                "type": "update",
+                "data": {
+                    "model": {"messages": [ai_message(tool_call("bash", {}))]},
+                    "tools": {"messages": [tool_message("bash")]},
+                },
+            },
+            [],
+        ),
+        ({"type": "update", "data": {"model": {"messages": [ai_message()]}}}, []),
+        ({"type": "update", "data": {"model": None}}, []),
+        ({"type": "update", "data": {"model": {"messages": "x"}}}, []),
+        (
+            {"type": "update", "data": {"m": {"messages": [{"type": "tool"}]}}},
+            [],
+        ),
+        ({"type": "message", "data": {"model": {"messages": []}}}, []),
+    ],
+)
+def test_extract_server_tools(event, expected):
+    assert extract_server_tools(event, client_tool_names={"bash"}) == expected
+
+
+def test_long_tool_input_is_shortened():
+    url = "https://example.com/" + "a" * 200
+    event = {
+        "type": "update",
+        "data": {"model": {"messages": [ai_message(tool_call("t", {"url": url}))]}},
+    }
+
+    (activity,) = extract_server_tools(event)
+
+    assert len(activity.detail) == client.MAX_DETAIL_LENGTH
+    assert activity.detail.endswith("…")

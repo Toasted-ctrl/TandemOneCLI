@@ -16,8 +16,28 @@ from tandemonecli.tools.bash import BASH_TOOL_SPEC
 
 STREAM_PATH = "/api/v1/inference/conversation/stream"
 STATUS_MESSAGE = "[bold green]Thinking..."
+CLIENT_TOOLS = [BASH_TOOL_SPEC]
+CLIENT_TOOL_NAMES = frozenset(spec["name"] for spec in CLIENT_TOOLS)
 
 console = Console()
+
+
+# Longest tool input or error shown in a server tool line, in characters
+MAX_DETAIL_LENGTH = 120
+
+
+def show_server_tool(activity: "ServerToolActivity") -> None:
+    """Show that SynapseAPI itself is using a tool, such as reading a web page."""
+    label = safe_markup(activity.name.replace("_", " "))
+    detail = safe_markup(activity.detail)
+    if activity.status == "started":
+        line = f"[bold cyan]⟳ {label}[/bold cyan]"
+        console.print(f"{line} {detail}" if detail else line)
+    elif activity.status == "error":
+        line = f"[bold red]✗ {label} failed[/bold red]"
+        console.print(f"{line}: {detail}" if detail else line)
+    else:
+        console.print(f"[bold green]✓ {label}[/bold green]")
 
 
 def iter_sse_data(lines: Iterable[str]) -> Iterator[str]:
@@ -132,6 +152,93 @@ def extract_tool_calls(event: dict[str, Any]) -> list[ToolCall]:
 
 
 @dataclass(frozen=True)
+class ServerToolActivity:
+    """A tool that SynapseAPI runs itself, such as web search, starting or done."""
+
+    name: str
+    # "started", "success" or "error"
+    status: str
+    # For a start, the tool's input (such as the URL); for an error, the reason
+    detail: str = ""
+
+
+def _shorten(text: str) -> str:
+    """Return the first non-blank line of text, cut to MAX_DETAIL_LENGTH."""
+    line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if len(line) > MAX_DETAIL_LENGTH:
+        return line[: MAX_DETAIL_LENGTH - 1] + "…"
+    return line
+
+
+def _summarize_args(args: Any) -> str:
+    """Return the most telling part of a tool's input, such as its URL or query."""
+    if not isinstance(args, dict):
+        return ""
+    for key in ("query", "url", "urls"):
+        value = args.get(key)
+        if isinstance(value, str):
+            return _shorten(value)
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return _shorten(", ".join(value))
+    return _shorten(json.dumps(args, ensure_ascii=False)) if args else ""
+
+
+def _update_messages(event: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield the messages in an ``update`` event, from every agent step in it.
+
+    The data of an update maps each step that finished (such as ``model`` or
+    ``tools``) to its output; the messages in it are serialized LangChain messages.
+    """
+    if event.get("type") != "update":
+        return
+    for step_output in event["data"].values():
+        if not isinstance(step_output, dict):
+            continue
+        messages = step_output.get("messages")
+        if isinstance(messages, list):
+            yield from (m for m in messages if isinstance(m, dict))
+
+
+def extract_server_tools(
+    event: dict[str, Any], client_tool_names: Iterable[str] = ()
+) -> list[ServerToolActivity]:
+    """Return the server-side tool calls and results in an ``update`` event.
+
+    Server-side tools, such as web search, run inside SynapseAPI, so the CLI
+    doesn't get a ``tool_request`` for them. A finished model step lists the tool
+    calls the model made (with their full input); a finished tool step has their
+    results, with a status of "success" or "error". Calls of client tools are
+    skipped, as the CLI shows those itself.
+    """
+    skipped = set(client_tool_names)
+    activity: list[ServerToolActivity] = []
+    for message in _update_messages(event):
+        message_type = message.get("type")
+        if message_type == "ai" and isinstance(message.get("tool_calls"), list):
+            for call in message["tool_calls"]:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                if isinstance(name, str) and name not in skipped:
+                    activity.append(
+                        ServerToolActivity(
+                            name, "started", _summarize_args(call.get("args"))
+                        )
+                    )
+        elif message_type == "tool":
+            name = message.get("name")
+            if not isinstance(name, str) or name in skipped:
+                continue
+            if message.get("status") == "error":
+                content = message.get("content")
+                reason = _shorten(content) if isinstance(content, str) else ""
+                activity.append(ServerToolActivity(name, "error", reason))
+            else:
+                activity.append(ServerToolActivity(name, "success"))
+    return activity
+
+
+@dataclass(frozen=True)
 class StreamResult:
     """The outcome of a streamed response."""
 
@@ -170,6 +277,7 @@ def stream_response(
     prompt: str | None,
     provider: str,
     model_name: str,
+    web_search: bool = False,
     thread_id: str | None = None,
     tool_results: Sequence[ToolResult] | None = None,
 ) -> StreamResult:
@@ -201,7 +309,8 @@ def stream_response(
         },
         "system_prompt": SYSTEM_PROMPT,
         # Sent with every request, also with tool results, so the model keeps them
-        "client_tools": [BASH_TOOL_SPEC],
+        "client_tools": CLIENT_TOOLS,
+        "tools": {"web_search": web_search},
     }
     if tool_results is not None:
         payload["tool_results"] = [asdict(result) for result in tool_results]
@@ -247,6 +356,18 @@ def stream_response(
 
                 elif event.get("type") == "tool_request":
                     tool_calls += extract_tool_calls(event)
+
+                elif server_tools := extract_server_tools(
+                    event, client_tool_names=CLIENT_TOOL_NAMES
+                ):
+                    # Print below what's shown of the reply so far
+                    status.stop()
+                    printer.pause()
+                    for activity in server_tools:
+                        show_server_tool(activity)
+                    # Keep the spinner going while the tools run or the model reads
+                    # their results
+                    status.start()
 
                 elif detail := _data_str(event, "error", "detail"):
                     failed = True

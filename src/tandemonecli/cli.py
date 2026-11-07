@@ -1,5 +1,6 @@
 from rich.console import Console
 from rich.prompt import Prompt
+from rich.text import Text
 
 from tandemonecli.config.settings import tocli_settings
 from tandemonecli.permissions import (
@@ -30,6 +31,9 @@ console = Console()
 # Lines of command output shown in the terminal, each cut to the terminal's
 # width; the model gets all of it
 OUTPUT_PREVIEW_LINES = 5
+
+# Style of your echoed message; plain on basic terminals
+USER_STYLE = "grey70 on grey15"
 
 
 class ApprovalPrompt(Prompt):
@@ -191,6 +195,21 @@ def _run_tool_call(call: ToolCall) -> ToolResult:
     )
 
 
+def show_user_message(user_input: str) -> None:
+    """Echo your message on a full-width background, with a blank line after.
+
+    The "You:" prefix and background bar set your message apart from the
+    reply; the blank line keeps them apart on terminals without colour.
+    """
+    text = strip_control_chars(user_input).strip()
+    message = Text("You: ", style=USER_STYLE)
+    message.append(text, style=USER_STYLE)
+    # Stretch the background to the full width, so your message is a clear bar
+    message.append(" " * max(0, console.width - len(message.plain)), style=USER_STYLE)
+    console.print(message)
+    console.print()
+
+
 def run_conversation_turn(
     state: SlashState, user_input: str, provider: str, model_name: str
 ) -> None:
@@ -210,6 +229,7 @@ def run_conversation_turn(
             model_name=model_name,
             thread_id=state.thread_id,
             tool_results=tool_results,
+            web_search=state.web,
         )
         state.thread_id = result.thread_id
 
@@ -223,6 +243,26 @@ def run_conversation_turn(
 
         tool_results = [run_tool_call(call) for call in result.tool_calls]
         prompt = None
+
+
+def build_prompt_text(state: SlashState) -> str:
+    """Build the input prompt: the selected provider/model and a web badge."""
+    # Names come from the API, so escape them before adding markup
+    provider = safe_markup(state.selected_provider or "")
+    model = safe_markup(state.selected_model or "")
+    if state.selected_model:
+        context = (
+            f"[ [bold cyan]{provider}[/bold cyan] / "
+            f"[bold magenta]{model}[/bold magenta] ] "
+        )
+    elif state.selected_provider:
+        context = f"[ [bold cyan]{provider}[/bold cyan] ] "
+    else:
+        context = ""
+
+    # Shown on every prompt so it's always clear the model can go online
+    web_badge = "[bold black on green] ✓ web [/bold black on green] "
+    return f"> {context}{web_badge if state.web else ''}"
 
 
 def main():
@@ -256,20 +296,8 @@ def main():
 
     while True:
         try:
-            # Build prompt with context and Rich markup
-            # Names come from the API, so escape them before adding markup
             state = slash_handler.state
-            provider = safe_markup(state.selected_provider or "")
-            model = safe_markup(state.selected_model or "")
-            if state.selected_model:
-                prompt_text = (
-                    f"> [ [bold cyan]{provider}[/bold cyan] / "
-                    f"[bold magenta]{model}[/bold magenta] ] "
-                )
-            elif state.selected_provider:
-                prompt_text = f"> [ [bold cyan]{provider}[/bold cyan] ] "
-            else:
-                prompt_text = "> "
+            prompt_text = build_prompt_text(state)
 
             # A line above the prompt sets your input apart from the output
             console.rule(style="dim")
@@ -288,6 +316,7 @@ def main():
             # Regular input (not a command)
             if user_input:
                 if state.selected_provider and state.selected_model:
+                    show_user_message(user_input)
                     # Continue the current conversation, if there is one
                     run_conversation_turn(
                         state,
