@@ -1,6 +1,6 @@
 import pytest
 
-from tandemonecli.text import safe_markup, strip_control_chars
+from tandemonecli.text import safe_markup, show_control_chars, strip_control_chars
 
 
 @pytest.mark.parametrize(
@@ -26,3 +26,7 @@ def test_strip_control_chars_keeps_normal_text():
 def test_safe_markup_escapes_markup_and_strips_control_chars():
     # "[31m" isn't a valid Rich tag, so Rich leaves it as plain text
     assert safe_markup("\x1b[31m[bold]hi[/bold]") == "[31m\\[bold]hi\\[/bold]"
+
+
+def test_show_control_chars_makes_them_visible():
+    assert show_control_chars("rm\x1b[2K -rf\r\n\tok") == "rm\\x1b[2K -rf\\x0d\n\tok"

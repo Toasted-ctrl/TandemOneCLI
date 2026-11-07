@@ -7,8 +7,11 @@ from rich.console import Console
 
 from tandemonecli.stream import client
 from tandemonecli.stream.client import (
+    ToolCall,
+    ToolResult,
     _is_invalid_thread,
     extract_content,
+    extract_tool_calls,
     iter_content,
     iter_events,
     iter_sse_data,
@@ -179,7 +182,12 @@ def test_stream_response_sends_expected_request(monkeypatch, console):
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         },
-        json={"prompt": "hello", "model": {"provider": "openai", "name": "kimi-k3"}},
+        json={
+            "model": {"provider": "openai", "name": "kimi-k3"},
+            "system_prompt": client.SYSTEM_PROMPT,
+            "client_tools": [client.BASH_TOOL_SPEC],
+            "prompt": "hello",
+        },
         stream=True,
         timeout=30,
     )
@@ -362,20 +370,20 @@ def test_existing_conversation_sends_thread_id(monkeypatch, console):
 def test_returns_thread_id_from_thread_event(monkeypatch, console):
     fake_post(monkeypatch, [*thread_event(THREAD_A), *sse_lines("Hi")])
 
-    assert stream_response("key", "hi", "openai", "kimi-k3") == THREAD_A
+    assert stream_response("key", "hi", "openai", "kimi-k3").thread_id == THREAD_A
     assert console.export_text() == "Hi\n"
 
 
 def test_returns_thread_id_from_header(monkeypatch, console):
     fake_post(monkeypatch, sse_lines("Hi"), headers={"X-Thread-ID": THREAD_A})
 
-    assert stream_response("key", "hi", "openai", "kimi-k3") == THREAD_A
+    assert stream_response("key", "hi", "openai", "kimi-k3").thread_id == THREAD_A
 
 
 def test_thread_event_takes_precedence_over_header(monkeypatch, console):
     fake_post(monkeypatch, thread_event(THREAD_B), headers={"X-Thread-ID": THREAD_A})
 
-    assert stream_response("key", "hi", "openai", "kimi-k3") == THREAD_B
+    assert stream_response("key", "hi", "openai", "kimi-k3").thread_id == THREAD_B
 
 
 def test_returns_given_thread_id_when_server_sends_none(monkeypatch, console):
@@ -383,13 +391,13 @@ def test_returns_given_thread_id_when_server_sends_none(monkeypatch, console):
 
     result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
 
-    assert result == THREAD_A
+    assert result.thread_id == THREAD_A
 
 
 def test_returns_none_for_new_conversation_without_thread(monkeypatch, console):
     fake_post(monkeypatch, sse_lines("Hi"))
 
-    assert stream_response("key", "hi", "openai", "kimi-k3") is None
+    assert stream_response("key", "hi", "openai", "kimi-k3").thread_id is None
 
 
 def test_keeps_thread_id_on_connection_error(monkeypatch, console):
@@ -401,7 +409,7 @@ def test_keeps_thread_id_on_connection_error(monkeypatch, console):
 
     result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
 
-    assert result == THREAD_A
+    assert result.thread_id == THREAD_A
 
 
 def test_keeps_thread_id_on_other_http_errors(monkeypatch, console):
@@ -409,7 +417,7 @@ def test_keeps_thread_id_on_other_http_errors(monkeypatch, console):
 
     result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
 
-    assert result == THREAD_A
+    assert result.thread_id == THREAD_A
 
 
 def test_invalid_thread_starts_new_conversation(monkeypatch, console):
@@ -423,7 +431,7 @@ def test_invalid_thread_starts_new_conversation(monkeypatch, console):
     result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
 
     output = " ".join(console.export_text().split())
-    assert result is None
+    assert result.thread_id is None
     assert "could not be found" in output
     assert "next message will start a new conversation" in output
 
@@ -433,7 +441,7 @@ def test_other_404_keeps_thread_id(monkeypatch, console):
 
     result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
 
-    assert result == THREAD_A
+    assert result.thread_id == THREAD_A
     assert "Error streaming response: 404 Error" in console.export_text()
 
 
@@ -443,7 +451,7 @@ def test_404_with_non_json_body_keeps_thread_id(monkeypatch, console):
 
     result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
 
-    assert result == THREAD_A
+    assert result.thread_id == THREAD_A
 
 
 # --- Error events ------------------------------------------------------------
@@ -483,7 +491,7 @@ def test_error_event_detail_is_not_interpreted_as_markup(monkeypatch, console):
 def test_error_event_keeps_thread_id(monkeypatch, console):
     fake_post(monkeypatch, [*thread_event(THREAD_A), *error_event("failed")])
 
-    assert stream_response("key", "hi", "openai", "kimi-k3") == THREAD_A
+    assert stream_response("key", "hi", "openai", "kimi-k3").thread_id == THREAD_A
 
 
 # --- parse_event and iter_events ---------------------------------------------
@@ -582,7 +590,7 @@ def test_invalid_thread_error_without_thread_is_reported(monkeypatch, console):
     result = stream_response("key", "hi", "openai", "kimi-k3")
 
     output = console.export_text()
-    assert result is None
+    assert result.thread_id is None
     assert "Error streaming response: 404 Error" in output
     assert "could not be found" not in output
 
@@ -632,3 +640,158 @@ def test_escape_sequences_in_error_detail_are_stripped(monkeypatch, console):
     stream_response("key", "hi", "openai", "kimi-k3")
 
     assert "\x1b" not in console.export_text()
+
+
+# --- Response text -----------------------------------------------------------
+
+
+def test_returns_full_reply_text(monkeypatch, console):
+    fake_post(monkeypatch, sse_lines("Listing ", "the files."))
+
+    result = stream_response("key", "hi", "openai", "kimi-k3")
+
+    assert result.text == "Listing the files."
+    assert result.failed is False
+
+
+def test_reply_text_keeps_control_chars(monkeypatch, console):
+    # The terminal shows them stripped, but the text is returned as received
+    fake_post(monkeypatch, sse_lines("a\x1bb"))
+
+    assert stream_response("key", "hi", "openai", "kimi-k3").text == "a\x1bb"
+
+
+def test_error_event_marks_result_failed(monkeypatch, console):
+    fake_post(monkeypatch, [*sse_lines("Partial rep"), *error_event("failed")])
+
+    result = stream_response("key", "hi", "openai", "kimi-k3")
+
+    assert result.failed is True
+    assert result.text == "Partial rep"
+
+
+def test_http_error_marks_result_failed(monkeypatch, console):
+    fake_post(monkeypatch, [], status_code=500)
+
+    assert stream_response("key", "hi", "openai", "kimi-k3").failed is True
+
+
+def test_connection_error_marks_result_failed(monkeypatch, console):
+    monkeypatch.setattr(
+        client.requests,
+        "post",
+        MagicMock(side_effect=requests.exceptions.ConnectionError("down")),
+    )
+
+    assert stream_response("key", "hi", "openai", "kimi-k3").failed is True
+
+
+# --- Client tools ------------------------------------------------------------
+
+
+def tool_request_event(*calls: dict) -> list[str]:
+    payload = {"type": "tool_request", "data": {"tool_calls": list(calls)}}
+    return [f"data: {json.dumps(payload)}", ""]
+
+
+LS_CALL = {"tool_call_id": "call-1", "name": "bash", "args": {"command": "ls"}}
+
+
+def test_sends_bash_tool_and_no_stop_sequence(monkeypatch, console):
+    post = fake_post(monkeypatch, [])
+
+    stream_response("key", "hi", "openai", "kimi-k3")
+
+    payload = sent_payload(post)
+    assert payload["client_tools"] == [client.BASH_TOOL_SPEC]
+    assert client.BASH_TOOL_SPEC["name"] == "bash"
+    assert "stop_sequence" not in payload
+
+
+def test_sends_tool_results_instead_of_prompt(monkeypatch, console):
+    post = fake_post(monkeypatch, [])
+
+    stream_response(
+        "key",
+        None,
+        "openai",
+        "kimi-k3",
+        thread_id=THREAD_A,
+        tool_results=[
+            ToolResult("call-1", "out"),
+            ToolResult("call-2", "declined", is_error=True),
+        ],
+    )
+
+    payload = sent_payload(post)
+    assert "prompt" not in payload
+    assert payload["thread_id"] == THREAD_A
+    assert payload["tool_results"] == [
+        {"tool_call_id": "call-1", "content": "out", "is_error": False},
+        {"tool_call_id": "call-2", "content": "declined", "is_error": True},
+    ]
+    # The tools are sent again, so the model keeps them
+    assert payload["client_tools"] == [client.BASH_TOOL_SPEC]
+
+
+def test_returns_tool_calls_from_tool_request_event(monkeypatch, console):
+    other = {"tool_call_id": "call-2", "name": "bash", "args": {"command": "pwd"}}
+    fake_post(
+        monkeypatch,
+        [*sse_lines("Let me look."), *tool_request_event(LS_CALL, other)],
+    )
+
+    result = stream_response("key", "hi", "openai", "kimi-k3")
+
+    assert result.tool_calls == (
+        ToolCall("call-1", "bash", {"command": "ls"}),
+        ToolCall("call-2", "bash", {"command": "pwd"}),
+    )
+    assert result.failed is False
+    assert "call-1" not in console.export_text()
+
+
+def test_reply_without_tool_request_has_no_tool_calls(monkeypatch, console):
+    fake_post(monkeypatch, sse_lines("Hi"))
+
+    assert stream_response("key", "hi", "openai", "kimi-k3").tool_calls == ()
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"tool_calls": [LS_CALL]}, [ToolCall("call-1", "bash", {"command": "ls"})]),
+        ({"tool_calls": "nope"}, []),
+        ({}, []),
+        ({"tool_calls": ["nope", {"name": "bash"}, {"tool_call_id": "x"}]}, []),
+        (
+            {"tool_calls": [{"tool_call_id": "x", "name": "bash", "args": "ls"}]},
+            [ToolCall("x", "bash", {})],
+        ),
+    ],
+)
+def test_extract_tool_calls_skips_invalid_calls(data, expected):
+    assert extract_tool_calls({"type": "tool_request", "data": data}) == expected
+
+
+def test_extract_tool_calls_ignores_other_events():
+    event = {"type": "message", "data": {"tool_calls": [LS_CALL]}}
+
+    assert extract_tool_calls(event) == []
+
+
+def test_waiting_for_tool_results_is_explained(monkeypatch, console):
+    fake_post(
+        monkeypatch,
+        [],
+        status_code=409,
+        error_body={"detail": {"message": "waiting", "pending_tool_calls": []}},
+    )
+
+    result = stream_response("key", "hi", "openai", "kimi-k3", thread_id=THREAD_A)
+
+    output = console.export_text()
+    assert result.failed is True
+    assert result.thread_id == THREAD_A
+    assert "still waiting for the result of a command" in output
+    assert "/new" in output

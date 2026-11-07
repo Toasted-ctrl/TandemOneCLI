@@ -1,14 +1,17 @@
 """Client for the SynapseAPI streaming inference endpoint."""
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import requests
 from rich.console import Console
 
 from tandemonecli.config.settings import tocli_settings
+from tandemonecli.prompts.system import SYSTEM_PROMPT
 from tandemonecli.text import safe_markup, strip_control_chars
+from tandemonecli.tools.bash import BASH_TOOL_SPEC
 
 STREAM_PATH = "/api/v1/inference/conversation/stream"
 STATUS_MESSAGE = "[bold green]Thinking..."
@@ -84,6 +87,65 @@ def iter_content(lines: Iterable[str]) -> Iterator[str]:
             yield content
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    """A call of a client tool the model made, waiting for its result."""
+
+    tool_call_id: str
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """The result of a tool call, sent back to continue the model's run."""
+
+    tool_call_id: str
+    content: str
+    # True if the tool failed or the user declined to run it
+    is_error: bool = False
+
+
+def extract_tool_calls(event: dict[str, Any]) -> list[ToolCall]:
+    """Return the tool calls of a ``tool_request`` event, skipping invalid ones."""
+    if event.get("type") != "tool_request":
+        return []
+    calls = event["data"].get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+
+    tool_calls: list[ToolCall] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        tool_call_id, name, args = (
+            call.get("tool_call_id"),
+            call.get("name"),
+            call.get("args"),
+        )
+        if isinstance(tool_call_id, str) and isinstance(name, str):
+            tool_calls.append(
+                ToolCall(tool_call_id, name, args if isinstance(args, dict) else {})
+            )
+    return tool_calls
+
+
+@dataclass(frozen=True)
+class StreamResult:
+    """The outcome of a streamed response."""
+
+    # ID to send with the next message to continue the conversation,
+    # or None if the next message should start a new conversation
+    thread_id: str | None
+    # The full text of the model's reply, as received (control chars not stripped)
+    text: str = ""
+    # True if the request failed or the stream reported an error, so the text
+    # may be incomplete
+    failed: bool = False
+    # Tool calls the model is waiting on; send their results to continue
+    tool_calls: tuple[ToolCall, ...] = ()
+
+
 def _is_invalid_thread(error: requests.HTTPError) -> bool:
     """Return True if SynapseAPI rejected the request because of an unknown thread."""
     response = error.response
@@ -95,25 +157,35 @@ def _is_invalid_thread(error: requests.HTTPError) -> bool:
         return False
 
 
+def _is_waiting_for_tool_results(error: requests.HTTPError) -> bool:
+    """Return True if SynapseAPI rejected a message because the model is still
+    waiting for tool results."""
+    response = error.response
+    return response is not None and response.status_code == 409
+
+
 def stream_response(
     api_key: str,
-    prompt: str,
+    prompt: str | None,
     provider: str,
     model_name: str,
     thread_id: str | None = None,
-) -> str | None:
+    tool_results: Sequence[ToolResult] | None = None,
+) -> StreamResult:
     """Stream an inference response to the terminal as it arrives.
 
     Args:
         api_key: API key for authentication
-        prompt: The user's input prompt
+        prompt: The user's input prompt, or None when sending tool results
         provider: The model provider (e.g., "openai")
         model_name: The model name (e.g., "gpt-4")
         thread_id: ID of the conversation to continue, or None to start a new one
+        tool_results: Results of the tool calls the model is waiting on, sent
+            instead of a prompt to continue its run (requires thread_id)
 
     Returns:
-        The thread ID to send with the next message to continue the conversation,
-        or None if the next message should start a new conversation.
+        The thread ID for the next message (None to start a new conversation),
+        the full text of the reply and the tool calls the model is waiting on.
     """
     headers = {
         "X-API-Key": api_key,
@@ -122,12 +194,18 @@ def stream_response(
     }
 
     payload: dict[str, Any] = {
-        "prompt": prompt,
         "model": {
             "provider": provider,
             "name": model_name,
         },
+        "system_prompt": SYSTEM_PROMPT,
+        # Sent with every request, also with tool results, so the model keeps them
+        "client_tools": [BASH_TOOL_SPEC],
     }
+    if tool_results is not None:
+        payload["tool_results"] = [asdict(result) for result in tool_results]
+    else:
+        payload["prompt"] = prompt
     if thread_id:
         payload["thread_id"] = thread_id
 
@@ -135,6 +213,9 @@ def stream_response(
     status = console.status(STATUS_MESSAGE, spinner="dots")
     status.start()
     has_output = False
+    chunks: list[str] = []
+    tool_calls: list[ToolCall] = []
+    failed = False
 
     def end_output_line() -> None:
         """Stop the spinner and move to a new line if text was printed."""
@@ -166,13 +247,18 @@ def stream_response(
                 if new_thread_id := _data_str(event, "thread", "thread_id"):
                     thread_id = new_thread_id
 
+                elif event.get("type") == "tool_request":
+                    tool_calls += extract_tool_calls(event)
+
                 elif detail := _data_str(event, "error", "detail"):
+                    failed = True
                     end_output_line()
                     console.print(
                         f"[red]Error from SynapseAPI:[/red] {safe_markup(detail)}"
                     )
 
                 elif content := _data_str(event, "message", "content"):
+                    chunks.append(content)
                     if not has_output:
                         status.stop()
                         has_output = True
@@ -189,16 +275,24 @@ def stream_response(
             end_output_line()
 
     except requests.HTTPError as e:
+        failed = True
         end_output_line()
         if thread_id and _is_invalid_thread(e):
             console.print(
                 "[red]This conversation could not be found.[/red] "
                 "Your next message will start a new conversation."
             )
-            return None
-        console.print(f"[red]Error streaming response: {safe_markup(str(e))}[/red]")
+            return StreamResult(thread_id=None, text="".join(chunks), failed=True)
+        if _is_waiting_for_tool_results(e):
+            console.print(
+                "[red]The model is still waiting for the result of a command.[/red] "
+                "Use /new to start a new conversation."
+            )
+        else:
+            console.print(f"[red]Error streaming response: {safe_markup(str(e))}[/red]")
 
     except requests.exceptions.RequestException as e:
+        failed = True
         end_output_line()
         console.print(f"[red]Error streaming response: {safe_markup(str(e))}[/red]")
 
@@ -206,4 +300,9 @@ def stream_response(
         # Also stops the spinner on Ctrl+C; stopping twice is harmless
         status.stop()
 
-    return thread_id
+    return StreamResult(
+        thread_id=thread_id,
+        text="".join(chunks),
+        failed=failed,
+        tool_calls=tuple(tool_calls),
+    )

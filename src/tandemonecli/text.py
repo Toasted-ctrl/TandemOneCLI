@@ -21,3 +21,12 @@ def safe_markup(text: str) -> str:
     Removes terminal control characters and escapes Rich markup like ``[bold]``.
     """
     return escape(strip_control_chars(text))
+
+
+def show_control_chars(text: str) -> str:
+    """Replace control characters with visible ``\\xNN`` escapes.
+
+    Use this where the user must see exactly what the text contains, such as a
+    command they are asked to approve, instead of silently dropping them.
+    """
+    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)

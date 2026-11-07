@@ -8,6 +8,7 @@ from rich.console import Console
 from tandemonecli import cli
 from tandemonecli.startup.models import AvailableModels
 from tandemonecli.startup.user import User
+from tandemonecli.stream.client import StreamResult, ToolCall, ToolResult
 
 
 @pytest.fixture
@@ -25,7 +26,7 @@ def fake_api(monkeypatch, available_models) -> dict[str, MagicMock]:
         return_value=User(user_id=uuid4(), first_name="Ada", last_name="Lovelace")
     )
     get_models = MagicMock(return_value=available_models)
-    stream_response = MagicMock()
+    stream_response = MagicMock(return_value=StreamResult(None))
     monkeypatch.setattr(cli, "get_user", get_user)
     monkeypatch.setattr(cli, "get_models", get_models)
     monkeypatch.setattr(cli, "stream_response", stream_response)
@@ -156,6 +157,7 @@ def test_input_is_streamed_to_selected_model(monkeypatch, console, fake_api):
         provider="openai",
         model_name="gpt-a",
         thread_id=None,
+        tool_results=None,
     )
 
 
@@ -190,7 +192,7 @@ def stream_calls(fake_api) -> list:
 
 
 def test_thread_id_is_reused_for_next_message(monkeypatch, console, fake_api):
-    fake_api["stream_response"].return_value = "thread-1"
+    fake_api["stream_response"].return_value = StreamResult("thread-1")
 
     run(monkeypatch, console, [*SELECT_MODEL, "first", "second", "exit"])
 
@@ -200,7 +202,11 @@ def test_thread_id_is_reused_for_next_message(monkeypatch, console, fake_api):
 
 
 def test_latest_thread_id_is_used(monkeypatch, console, fake_api):
-    fake_api["stream_response"].side_effect = ["thread-1", "thread-2", "thread-2"]
+    fake_api["stream_response"].side_effect = [
+        StreamResult("thread-1"),
+        StreamResult("thread-2"),
+        StreamResult("thread-2"),
+    ]
 
     run(monkeypatch, console, [*SELECT_MODEL, "one", "two", "three", "exit"])
 
@@ -212,7 +218,7 @@ def test_latest_thread_id_is_used(monkeypatch, console, fake_api):
 
 
 def test_new_command_starts_new_conversation(monkeypatch, console, fake_api):
-    fake_api["stream_response"].return_value = "thread-1"
+    fake_api["stream_response"].return_value = StreamResult("thread-1")
 
     output, _ = run(
         monkeypatch, console, [*SELECT_MODEL, "first", "/new", "second", "exit"]
@@ -225,7 +231,7 @@ def test_new_command_starts_new_conversation(monkeypatch, console, fake_api):
 
 
 def test_conversation_continues_after_switching_model(monkeypatch, console, fake_api):
-    fake_api["stream_response"].return_value = "thread-1"
+    fake_api["stream_response"].return_value = StreamResult("thread-1")
 
     run(
         monkeypatch,
@@ -298,3 +304,255 @@ def test_prompt_escapes_provider_and_model_names(monkeypatch, console, fake_api)
 
     assert "\\[x]" in fake_prompt.prompts[1]
     assert "m\\[b]" in fake_prompt.prompts[2]
+
+
+# --- Bash commands -----------------------------------------------------------
+
+
+@pytest.fixture
+def confirm(monkeypatch) -> MagicMock:
+    """Stub the "Run it?" prompt; answers "no" unless a test changes it."""
+    fake = MagicMock(return_value=False)
+    monkeypatch.setattr(cli.Confirm, "ask", fake)
+    return fake
+
+
+@pytest.fixture
+def fake_bash(monkeypatch) -> MagicMock:
+    fake = MagicMock(
+        return_value=cli.BashResult(stdout="index.js\n", stderr="", exit_code=0)
+    )
+    monkeypatch.setattr(cli, "run_bash", fake)
+    return fake
+
+
+def bash_call(command: str, call_id: str = "call-1") -> ToolCall:
+    return ToolCall(call_id, "bash", {"command": command})
+
+
+def asks_for(*calls: ToolCall) -> StreamResult:
+    return StreamResult("thread-1", "I'll have a look.", tool_calls=calls)
+
+
+ASKS_FOR_LS = asks_for(bash_call("ls -la"))
+LS_OUTPUT = (
+    "<bash_output>\n<stdout>\nindex.js\n</stdout>\n<exit_code>0</exit_code>\n"
+    "</bash_output>"
+)
+
+
+def prompts_sent(fake_api) -> list[str | None]:
+    return [c.kwargs["prompt"] for c in stream_calls(fake_api)]
+
+
+def results_sent(fake_api) -> list[list[ToolResult] | None]:
+    return [c.kwargs["tool_results"] for c in stream_calls(fake_api)]
+
+
+def test_approved_command_runs_and_result_is_sent_back(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    confirm.return_value = True
+    fake_api["stream_response"].side_effect = [
+        ASKS_FOR_LS,
+        StreamResult("thread-1", "There is an index.js file."),
+    ]
+
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "what's here?", "exit"])
+
+    fake_bash.assert_called_once_with("ls -la")
+    assert prompts_sent(fake_api) == ["what's here?", None]
+    assert results_sent(fake_api) == [None, [ToolResult("call-1", LS_OUTPUT)]]
+    assert [c.kwargs["thread_id"] for c in stream_calls(fake_api)] == [
+        None,
+        "thread-1",
+    ]
+    assert "The model wants to run this command:\nls -la" in output
+    assert "index.js" in output
+
+
+def test_commands_keep_running_until_model_stops_asking(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    confirm.return_value = True
+    fake_api["stream_response"].side_effect = [
+        ASKS_FOR_LS,
+        asks_for(bash_call("pwd", "call-2")),
+        StreamResult("thread-1", "Done."),
+    ]
+
+    run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    assert [c.args[0] for c in fake_bash.call_args_list] == ["ls -la", "pwd"]
+    assert len(stream_calls(fake_api)) == 3
+    assert results_sent(fake_api)[2][0].tool_call_id == "call-2"
+
+
+def test_several_calls_in_one_reply_are_answered_together(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    confirm.side_effect = [True, False]
+    fake_api["stream_response"].side_effect = [
+        asks_for(bash_call("ls", "a"), bash_call("rm x", "b")),
+        StreamResult("thread-1", "OK."),
+    ]
+
+    run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    fake_bash.assert_called_once_with("ls")
+    sent = results_sent(fake_api)[1]
+    assert [(r.tool_call_id, r.is_error) for r in sent] == [("a", False), ("b", True)]
+
+
+def test_declined_command_is_reported_right_away(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    fake_api["stream_response"].side_effect = [
+        ASKS_FOR_LS,
+        StreamResult("thread-1", "OK, what should I do instead?"),
+        StreamResult("thread-1", "OK."),
+    ]
+
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "go", "use git", "exit"])
+
+    fake_bash.assert_not_called()
+    assert "Command not run." in output
+    assert results_sent(fake_api)[1] == [
+        ToolResult("call-1", cli.format_declined(), is_error=True)
+    ]
+    # The next message is sent as it is
+    assert prompts_sent(fake_api)[2] == "use git"
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, EOFError])
+def test_ctrl_c_at_confirm_declines_without_exiting(
+    monkeypatch, console, fake_api, confirm, fake_bash, error
+):
+    confirm.side_effect = error
+    fake_api["stream_response"].side_effect = [ASKS_FOR_LS, StreamResult("thread-1")]
+
+    output, prompt = run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    fake_bash.assert_not_called()
+    assert "Command not run." in output
+    assert results_sent(fake_api)[1][0].is_error is True
+    assert "Goodbye!" in output
+
+
+def test_tool_calls_in_failed_reply_are_ignored(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    fake_api["stream_response"].return_value = StreamResult(
+        "thread-1", tool_calls=(bash_call("rm -rf x"),), failed=True
+    )
+
+    run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    confirm.assert_not_called()
+    fake_bash.assert_not_called()
+    assert len(stream_calls(fake_api)) == 1
+
+
+def test_reply_without_tool_calls_asks_nothing(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    fake_api["stream_response"].return_value = StreamResult(
+        "thread-1", "Write <bash>\nls\n</bash> to run ls."
+    )
+
+    run(monkeypatch, console, [*SELECT_MODEL, "hi", "exit"])
+
+    # Commands are only taken from tool calls, never from the reply's text
+    confirm.assert_not_called()
+    assert len(stream_calls(fake_api)) == 1
+
+
+def test_unknown_tool_gets_error_result(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    fake_api["stream_response"].side_effect = [
+        asks_for(ToolCall("call-1", "[b]python[/b]", {"code": "1"})),
+        StreamResult("thread-1"),
+    ]
+
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    confirm.assert_not_called()
+    assert "unknown tool: [b]python[/b]" in output
+    result = results_sent(fake_api)[1][0]
+    assert result.is_error is True
+    assert "Unknown tool" in result.content
+
+
+@pytest.mark.parametrize("args", [{}, {"command": ""}, {"command": 5}])
+def test_bash_call_without_command_gets_error_result(
+    monkeypatch, console, fake_api, confirm, fake_bash, args
+):
+    fake_api["stream_response"].side_effect = [
+        asks_for(ToolCall("call-1", "bash", args)),
+        StreamResult("thread-1"),
+    ]
+
+    run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    confirm.assert_not_called()
+    assert results_sent(fake_api)[1][0].is_error is True
+
+
+def test_confirm_shows_hidden_control_chars(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    fake_api["stream_response"].side_effect = [
+        asks_for(bash_call("echo hi\x1b[1A\x1b[2Krm -rf x")),
+        StreamResult("thread-1"),
+    ]
+
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    assert "echo hi\\x1b[1A\\x1b[2Krm -rf x" in output
+
+
+def test_long_command_output_is_cut_short_on_screen(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    confirm.return_value = True
+    lines = "".join(f"line {i}\n" for i in range(30))
+    fake_bash.return_value = cli.BashResult(stdout=lines, stderr="", exit_code=0)
+    fake_api["stream_response"].side_effect = [ASKS_FOR_LS, StreamResult("thread-1")]
+
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    assert "line 19" in output
+    assert "line 20" not in output
+    assert "... 10 more lines (sent to the model)" in output
+    # The model still gets all of it
+    assert "line 29" in results_sent(fake_api)[1][0].content
+
+
+def test_failed_command_shows_exit_code(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    confirm.return_value = True
+    fake_bash.return_value = cli.BashResult(stdout="", stderr="nope\n", exit_code=2)
+    fake_api["stream_response"].side_effect = [ASKS_FOR_LS, StreamResult("thread-1")]
+
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    assert "nope" in output
+    assert "Exit code 2" in output
+    # The command ran, so its result isn't an error, even with a non-zero exit code
+    assert results_sent(fake_api)[1][0].is_error is False
+
+
+def test_timed_out_command_is_an_error_result(
+    monkeypatch, console, fake_api, confirm, fake_bash
+):
+    confirm.return_value = True
+    fake_bash.return_value = cli.BashResult(
+        stdout="", stderr="", exit_code=None, error="Command timed out"
+    )
+    fake_api["stream_response"].side_effect = [ASKS_FOR_LS, StreamResult("thread-1")]
+
+    run(monkeypatch, console, [*SELECT_MODEL, "go", "exit"])
+
+    assert results_sent(fake_api)[1][0].is_error is True
