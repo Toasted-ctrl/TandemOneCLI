@@ -607,7 +607,7 @@ wheels = [
 [[package]]
 name = "tandemonecli"
 version = "0.0.1"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "prompt-toolkit" },
     { name = "pydantic-settings" },

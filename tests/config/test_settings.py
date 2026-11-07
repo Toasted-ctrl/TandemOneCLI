@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tandemonecli.config.settings import TandemOneSettings, tocli_settings
+from tandemonecli.config import settings
+from tandemonecli.config.settings import (
+    TandemOneSettings,
+    load_settings,
+    tocli_settings,
+    user_config_dir,
+)
 
 
 def test_reads_api_key_from_environment(monkeypatch):
@@ -101,3 +107,71 @@ def test_example_env_file_lists_every_setting():
     }
 
     assert names == set(TandemOneSettings.model_fields)
+
+
+# --- Config file locations ---------------------------------------------------
+
+
+def test_user_config_dir_follows_xdg_config_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    assert user_config_dir() == tmp_path / "tandemone"
+
+
+def test_user_config_dir_defaults_to_dot_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert user_config_dir() == tmp_path / ".config" / "tandemone"
+
+
+@pytest.fixture
+def env_files(monkeypatch, tmp_path) -> tuple[Path, Path]:
+    """Point the settings at a repo and a user .env in a temporary directory."""
+    monkeypatch.delenv("SYNAPSE_API_KEY", raising=False)
+    monkeypatch.delenv("SYNAPSE_API_URL", raising=False)
+    repo_env = tmp_path / "repo.env"
+    user_env = tmp_path / "user.env"
+    monkeypatch.setattr(settings, "REPO_ENV_FILE", repo_env)
+    monkeypatch.setattr(settings, "USER_ENV_FILE", user_env)
+    return repo_env, user_env
+
+
+def test_load_settings_reads_user_config(env_files):
+    _, user_env = env_files
+    user_env.write_text(
+        "SYNAPSE_API_KEY=from-user\nSYNAPSE_API_URL=https://user.test\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_settings()
+
+    assert loaded.SYNAPSE_API_KEY == "from-user"
+    assert loaded.SYNAPSE_API_URL == "https://user.test"
+
+
+def test_load_settings_user_config_overrides_repo_env(env_files):
+    repo_env, user_env = env_files
+    repo_env.write_text(
+        "SYNAPSE_API_KEY=from-repo\nSYNAPSE_API_URL=https://repo.test\n",
+        encoding="utf-8",
+    )
+    user_env.write_text("SYNAPSE_API_KEY=from-user\n", encoding="utf-8")
+
+    loaded = load_settings()
+
+    assert loaded.SYNAPSE_API_KEY == "from-user"
+    # Settings missing from the user config still come from the repo .env
+    assert loaded.SYNAPSE_API_URL == "https://repo.test"
+
+
+def test_load_settings_exits_with_readable_message(env_files):
+    _, user_env = env_files
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_settings()
+
+    message = str(exc_info.value.code)
+    assert "SYNAPSE_API_KEY" in message
+    assert "SYNAPSE_API_URL" in message
+    assert str(user_env) in message

@@ -10,7 +10,8 @@ from rich.console import Console
 
 from tandemonecli.config.settings import tocli_settings
 from tandemonecli.prompts.system import SYSTEM_PROMPT
-from tandemonecli.text import safe_markup, strip_control_chars
+from tandemonecli.stream.markdown import MarkdownPrinter
+from tandemonecli.text import safe_markup
 from tandemonecli.tools.bash import BASH_TOOL_SPEC
 
 STREAM_PATH = "/api/v1/inference/conversation/stream"
@@ -212,18 +213,15 @@ def stream_response(
     # Show a spinner until the first chunk of text arrives
     status = console.status(STATUS_MESSAGE, spinner="dots")
     status.start()
-    has_output = False
+    printer = MarkdownPrinter(console)
     chunks: list[str] = []
     tool_calls: list[ToolCall] = []
     failed = False
 
-    def end_output_line() -> None:
-        """Stop the spinner and move to a new line if text was printed."""
-        nonlocal has_output
+    def end_output() -> None:
+        """Stop the spinner and print the rest of the reply."""
         status.stop()
-        if has_output:
-            console.print()
-            has_output = False
+        printer.finish()
 
     try:
         with requests.post(
@@ -252,31 +250,22 @@ def stream_response(
 
                 elif detail := _data_str(event, "error", "detail"):
                     failed = True
-                    end_output_line()
+                    end_output()
                     console.print(
                         f"[red]Error from SynapseAPI:[/red] {safe_markup(detail)}"
                     )
 
                 elif content := _data_str(event, "message", "content"):
                     chunks.append(content)
-                    if not has_output:
-                        status.stop()
-                        has_output = True
-                    # markup=False so model output like "[bold]" is printed as-is
-                    # Strip escape sequences so output can't control the terminal
-                    console.print(
-                        strip_control_chars(content),
-                        end="",
-                        markup=False,
-                        highlight=False,
-                        soft_wrap=True,
-                    )
+                    # The spinner and the reply can't be shown live at once
+                    status.stop()
+                    printer.add(content)
 
-            end_output_line()
+            end_output()
 
     except requests.HTTPError as e:
         failed = True
-        end_output_line()
+        end_output()
         if thread_id and _is_invalid_thread(e):
             console.print(
                 "[red]This conversation could not be found.[/red] "
@@ -293,12 +282,12 @@ def stream_response(
 
     except requests.exceptions.RequestException as e:
         failed = True
-        end_output_line()
+        end_output()
         console.print(f"[red]Error streaming response: {safe_markup(str(e))}[/red]")
 
     finally:
-        # Also stops the spinner on Ctrl+C; stopping twice is harmless
-        status.stop()
+        # Also on Ctrl+C; stopping and finishing twice is harmless
+        end_output()
 
     return StreamResult(
         thread_id=thread_id,

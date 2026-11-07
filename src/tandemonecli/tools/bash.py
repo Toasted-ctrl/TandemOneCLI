@@ -21,7 +21,10 @@ those.
 import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from tandemonecli.tools.sandbox import sandbox_command, sandbox_env, sandbox_problem
 
 OPEN_TAG = "<bash>"
 CLOSE_TAG = "</bash>"
@@ -58,7 +61,9 @@ BASH_TOOL_SPEC: dict[str, Any] = {
     "description": (
         "Runs a shell command with bash in the project directory on the user's "
         "machine, after the user approves it. Returns stdout, stderr and the exit "
-        "code. Each call runs in a new shell. Commands can't read input and are "
+        "code. Each call runs in a new shell, in a sandbox where only the project "
+        "directory is writable and files outside it aren't visible. Commands can't "
+        "read input and are "
         f"stopped after {DEFAULT_TIMEOUT} seconds; very long output is truncated."
     ),
     "input_schema": {
@@ -113,14 +118,27 @@ def extract_tool_call_command(text: str) -> str | None:
     return None
 
 
-def run_bash(command: str, timeout: float = DEFAULT_TIMEOUT) -> BashResult:
-    """Run a command with bash in the current directory and capture its output.
+def refused(problem: str) -> BashResult:
+    """The result of a command that didn't run because the sandbox can't be used."""
+    return BashResult(
+        stdout="", stderr="", exit_code=None, error=f"Command not run: {problem}"
+    )
 
-    Stdin is closed, so commands that wait for input fail instead of hanging.
+
+def run_bash(command: str, root: Path, timeout: float = DEFAULT_TIMEOUT) -> BashResult:
+    """Run a command with bash in a sandbox confined to ``root``, and capture its output.
+
+    The command starts in ``root`` and can only change files there (see
+    ``tandemonecli.tools.sandbox``). If the sandbox can't be used, the command
+    doesn't run. Stdin is closed, so commands that wait for input fail instead of
+    hanging.
     """
+    if problem := sandbox_problem(root):
+        return refused(problem)
     try:
         completed = subprocess.run(
-            ["bash", "-c", command],
+            sandbox_command(root, command),
+            env=sandbox_env(),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

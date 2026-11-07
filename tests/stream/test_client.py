@@ -3,7 +3,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
-from rich.console import Console
+from rich.console import Console, Group
+from rich.markdown import Markdown
 
 from tandemonecli.stream import client
 from tandemonecli.stream.client import (
@@ -132,6 +133,11 @@ def console(monkeypatch) -> Console:
     return recording
 
 
+def output(console: Console) -> str:
+    """The printed text, without the spaces Rich pads Markdown lines with."""
+    return "\n".join(line.rstrip() for line in console.export_text().split("\n"))
+
+
 def fake_post(
     monkeypatch,
     lines: list[str],
@@ -159,7 +165,7 @@ def test_stream_response_prints_content(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == "Hello there!\n"
+    assert output(console) == "Hello there!\n"
 
 
 def test_stream_response_does_not_interpret_markup(monkeypatch, console):
@@ -167,7 +173,7 @@ def test_stream_response_does_not_interpret_markup(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == "use [bold]this[/bold]\n"
+    assert output(console) == "use [bold]this[/bold]\n"
 
 
 def test_stream_response_sends_expected_request(monkeypatch, console):
@@ -226,6 +232,15 @@ def test_stream_response_prints_connection_error(monkeypatch, console):
 # --- Spinner -----------------------------------------------------------------
 
 
+def describe(renderable) -> str:
+    """The text of a printed string or Markdown block."""
+    if isinstance(renderable, Group):
+        renderable = renderable.renderables[-1]
+    if isinstance(renderable, Markdown):
+        return renderable.markup
+    return str(renderable)
+
+
 class SpinnerSpy:
     """Records when the spinner starts and stops relative to printed output."""
 
@@ -241,7 +256,7 @@ class SpinnerSpy:
 
         def recording_print(*args, **kwargs):
             if args:
-                self.events.append(f"print:{args[0]}")
+                self.events.append(f"print:{describe(args[0])}")
             original_print(*args, **kwargs)
 
         monkeypatch.setattr(console, "print", recording_print)
@@ -270,8 +285,8 @@ def test_spinner_stops_before_first_text(monkeypatch, console, spinner):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert spinner.events.index("stop") < spinner.events.index("print:Hello")
-    assert console.export_text() == "Hello there\n"
+    assert spinner.events.index("stop") < spinner.events.index("print:Hello there")
+    assert output(console) == "Hello there\n"
 
 
 def test_spinner_stops_when_stream_has_no_text(monkeypatch, console, spinner):
@@ -280,7 +295,7 @@ def test_spinner_stops_when_stream_has_no_text(monkeypatch, console, spinner):
     stream_response("key", "hi", "openai", "kimi-k3")
 
     assert "stop" in spinner.events
-    assert console.export_text() == ""
+    assert output(console) == ""
 
 
 def test_spinner_stops_before_error_message(monkeypatch, console, spinner):
@@ -290,7 +305,7 @@ def test_spinner_stops_before_error_message(monkeypatch, console, spinner):
 
     first_print = next(e for e in spinner.events if e.startswith("print:"))
     assert spinner.events.index("stop") < spinner.events.index(first_print)
-    assert console.export_text() == "Error streaming response: 500 Error\n"
+    assert output(console) == "Error streaming response: 500 Error\n"
 
 
 def test_error_mid_stream_starts_on_new_line(monkeypatch, console, spinner):
@@ -303,7 +318,7 @@ def test_error_mid_stream_starts_on_new_line(monkeypatch, console, spinner):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == "partial\nError streaming response: dropped\n"
+    assert output(console) == "partial\nError streaming response: dropped\n"
 
 
 def test_spinner_stops_on_ctrl_c(monkeypatch, console, spinner):
@@ -317,7 +332,8 @@ def test_spinner_stops_on_ctrl_c(monkeypatch, console, spinner):
     with pytest.raises(KeyboardInterrupt):
         stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert spinner.events[-1] == "stop"
+    # The spinner stops, and the text received so far is still printed
+    assert spinner.events[-2:] == ["stop", "print:partial"]
 
 
 def test_spinner_stops_on_ctrl_c_before_first_text(monkeypatch, console, spinner):
@@ -371,7 +387,7 @@ def test_returns_thread_id_from_thread_event(monkeypatch, console):
     fake_post(monkeypatch, [*thread_event(THREAD_A), *sse_lines("Hi")])
 
     assert stream_response("key", "hi", "openai", "kimi-k3").thread_id == THREAD_A
-    assert console.export_text() == "Hi\n"
+    assert output(console) == "Hi\n"
 
 
 def test_returns_thread_id_from_header(monkeypatch, console):
@@ -462,9 +478,7 @@ def test_error_event_is_printed(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == (
-        "Error from SynapseAPI: Unable to connect to Provider\n"
-    )
+    assert output(console) == ("Error from SynapseAPI: Unable to connect to Provider\n")
 
 
 def test_error_event_after_text_starts_on_new_line(monkeypatch, console):
@@ -475,7 +489,7 @@ def test_error_event_after_text_starts_on_new_line(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == (
+    assert output(console) == (
         "partial\nError from SynapseAPI: Agent run failed unexpectedly\n"
     )
 
@@ -545,7 +559,7 @@ def test_non_text_events_print_nothing(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == "Answer\n"
+    assert output(console) == "Answer\n"
 
 
 def test_spinner_keeps_running_during_non_text_events(monkeypatch, console, spinner):
@@ -576,7 +590,7 @@ def test_byte_lines_are_decoded_as_utf8(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert console.export_text() == "café ☕\n"
+    assert output(console) == "café ☕\n"
 
 
 # --- Invalid thread detection ------------------------------------------------
@@ -629,9 +643,8 @@ def test_escape_sequences_in_content_are_stripped(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    output = console.export_text()
-    assert "\x1b" not in output
-    assert output == "safe[2J]0;pwned text\n"
+    assert "\x1b" not in console.export_text(clear=False)
+    assert output(console) == "safe[2J]0;pwned text\n"
 
 
 def test_escape_sequences_in_error_detail_are_stripped(monkeypatch, console):
@@ -639,7 +652,7 @@ def test_escape_sequences_in_error_detail_are_stripped(monkeypatch, console):
 
     stream_response("key", "hi", "openai", "kimi-k3")
 
-    assert "\x1b" not in console.export_text()
+    assert "\x1b" not in console.export_text(clear=False)
 
 
 # --- Response text -----------------------------------------------------------

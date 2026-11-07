@@ -1,4 +1,7 @@
 import subprocess
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,6 +15,7 @@ from tandemonecli.tools.bash import (
     run_bash,
     truncate,
 )
+from tandemonecli.tools.sandbox import sandbox_command, sandbox_problem
 
 # --- extract_bash_command ----------------------------------------------------
 
@@ -144,75 +148,128 @@ def test_tool_call_returns_none_without_a_command(text):
 
 # --- run_bash ----------------------------------------------------------------
 
+# Tests that really run commands need a working sandbox (bwrap isn't on every machine)
+needs_sandbox = pytest.mark.skipif(
+    sandbox_problem(Path(tempfile.gettempdir())) is not None,
+    reason="the bubblewrap sandbox isn't available here",
+)
 
-def test_run_bash_captures_stdout_and_exit_code():
-    result = run_bash("echo hello")
+
+@pytest.fixture
+def no_sandbox_check(monkeypatch):
+    """Skip the sandbox check, for tests that fake subprocess.run."""
+    monkeypatch.setattr(bash, "sandbox_problem", lambda root: None)
+
+
+@needs_sandbox
+def test_run_bash_captures_stdout_and_exit_code(tmp_path):
+    result = run_bash("echo hello", tmp_path)
 
     assert result == BashResult(stdout="hello\n", stderr="", exit_code=0)
 
 
-def test_run_bash_captures_stderr_and_failure():
-    result = run_bash("echo oops >&2; exit 3")
+@needs_sandbox
+def test_run_bash_captures_stderr_and_failure(tmp_path):
+    result = run_bash("echo oops >&2; exit 3", tmp_path)
 
     assert result.stderr == "oops\n"
     assert result.exit_code == 3
 
 
-def test_run_bash_uses_bash():
+@needs_sandbox
+def test_run_bash_uses_bash(tmp_path):
     # [[ ]] is bash syntax that plain sh doesn't support
-    assert run_bash("[[ 1 == 1 ]] && echo yes").stdout == "yes\n"
+    assert run_bash("[[ 1 == 1 ]] && echo yes", tmp_path).stdout == "yes\n"
 
 
-def test_run_bash_closes_stdin():
+@needs_sandbox
+def test_run_bash_runs_in_root(tmp_path):
+    assert run_bash("pwd", tmp_path).stdout == f"{tmp_path}\n"
+
+
+@needs_sandbox
+def test_run_bash_closes_stdin(tmp_path):
     # read fails at once instead of waiting for input
-    result = run_bash("read line", timeout=5)
+    result = run_bash("read line", tmp_path, timeout=5)
 
     assert result.exit_code == 1
 
 
-def test_run_bash_reports_timeout():
-    result = run_bash("echo started; sleep 5", timeout=0.5)
+@needs_sandbox
+def test_run_bash_reports_timeout(tmp_path):
+    result = run_bash("echo started; sleep 5", tmp_path, timeout=0.5)
 
     assert result.exit_code is None
     assert result.error is not None
     assert "timed out after 0.5 seconds" in result.error
 
 
-def test_run_bash_reports_interrupt(monkeypatch):
+@pytest.mark.usefixtures("no_sandbox_check")
+def test_run_bash_reports_interrupt(monkeypatch, tmp_path):
     def interrupted(*args, **kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(bash.subprocess, "run", interrupted)
 
-    result = run_bash("sleep 100")
+    result = run_bash("sleep 100", tmp_path)
 
     assert result.exit_code is None
     assert result.error is not None
     assert "interrupted" in result.error
 
 
-def test_run_bash_reports_missing_bash(monkeypatch):
+@pytest.mark.usefixtures("no_sandbox_check")
+def test_run_bash_reports_missing_program(monkeypatch, tmp_path):
     def missing(*args, **kwargs):
-        raise FileNotFoundError("No such file or directory: 'bash'")
+        raise FileNotFoundError("No such file or directory: 'bwrap'")
 
     monkeypatch.setattr(bash.subprocess, "run", missing)
 
-    result = run_bash("ls")
+    result = run_bash("ls", tmp_path)
 
     assert result.exit_code is None
-    assert result.error == "No such file or directory: 'bash'"
+    assert result.error == "No such file or directory: 'bwrap'"
 
 
-def test_run_bash_decodes_partial_output_after_timeout(monkeypatch):
+@pytest.mark.usefixtures("no_sandbox_check")
+def test_run_bash_decodes_partial_output_after_timeout(monkeypatch, tmp_path):
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired("bash", 1, output=b"partial", stderr=None)
 
     monkeypatch.setattr(bash.subprocess, "run", timeout)
 
-    result = run_bash("sleep 100", timeout=1)
+    result = run_bash("sleep 100", tmp_path, timeout=1)
 
     assert result.stdout == "partial"
     assert result.stderr == ""
+
+
+@pytest.mark.usefixtures("no_sandbox_check")
+def test_run_bash_runs_command_in_sandbox(monkeypatch, tmp_path):
+    run = MagicMock(
+        return_value=subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    )
+    monkeypatch.setattr(bash.subprocess, "run", run)
+    monkeypatch.setenv("SYNAPSE_API_KEY", "secret")
+
+    run_bash("ls", tmp_path)
+
+    args, kwargs = run.call_args
+    assert args[0] == sandbox_command(tmp_path, "ls")
+    assert "SYNAPSE_API_KEY" not in kwargs["env"]
+
+
+def test_run_bash_refuses_without_sandbox(monkeypatch, tmp_path):
+    run = MagicMock()
+    monkeypatch.setattr(bash.subprocess, "run", run)
+    monkeypatch.setattr(bash, "sandbox_problem", lambda root: "bwrap is missing")
+
+    result = run_bash("ls", tmp_path)
+
+    run.assert_not_called()
+    assert result == BashResult(
+        stdout="", stderr="", exit_code=None, error="Command not run: bwrap is missing"
+    )
 
 
 # --- Formatting --------------------------------------------------------------
