@@ -51,7 +51,7 @@ def fake_uv(monkeypatch, tmp_path) -> UvSetup:
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("UV_PYTHON_INSTALL_DIR", raising=False)
     return UvSetup(
-        programs=(bin_dir / "uv", bin_dir / "uvx"),
+        mounts=tuple((bin_dir / name, bin_dir / name) for name in ("uv", "uvx")),
         bin_dir=bin_dir,
         cache_dir=cache_dir,
         python_dir=python_dir,
@@ -151,8 +151,41 @@ def test_find_uv_in_system_directory_needs_no_mounts(monkeypatch):
     uv = find_uv()
 
     assert uv is not None
-    assert uv.programs == ()
+    assert uv.mounts == ()
     assert uv.bin_dir is None
+
+
+def test_find_uv_in_opt_is_added_to_path(monkeypatch):
+    # As on GitHub Actions: /opt is visible in the sandbox, but not on its PATH
+    monkeypatch.setattr(
+        sandbox.shutil, "which", lambda name: "/opt/hostedtoolcache/uv/0.9/x64/uv"
+    )
+
+    uv = find_uv()
+
+    assert uv is not None
+    assert uv.mounts == ()
+    assert uv.bin_dir == Path("/opt/hostedtoolcache/uv/0.9/x64")
+    assert sandbox_env()["PATH"].startswith("/opt/hostedtoolcache/uv/0.9/x64:")
+
+
+def test_find_uv_mounts_the_target_of_a_link(monkeypatch, tmp_path):
+    # A link in the home directory to uv elsewhere outside the system directories
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "uv").touch(mode=0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "uv").symlink_to(real_dir / "uv")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: str(bin_dir / "uv"))
+
+    uv = find_uv()
+
+    assert uv is not None
+    assert uv.mounts == (
+        (real_dir / "uv", real_dir / "uv"),
+        (real_dir / "uv", bin_dir / "uv"),
+    )
 
 
 def test_find_uv_without_uv(monkeypatch):
@@ -167,7 +200,7 @@ def test_uv_cache_and_pythons_are_overlaid(fake_uv, monkeypatch, tmp_path):
 
     args = sandbox_args(root)
 
-    uv, uvx = (str(program) for program in fake_uv.programs)
+    uv, uvx = (str(destination) for _, destination in fake_uv.mounts)
     assert option_values(args, "--ro-bind")[-2:] == [[uv, uv], [uvx, uvx]]
     overlays = [args[i + 1] for i, arg in enumerate(args) if arg == "--tmp-overlay"]
     assert overlays == [str(fake_uv.cache_dir), str(fake_uv.python_dir)]

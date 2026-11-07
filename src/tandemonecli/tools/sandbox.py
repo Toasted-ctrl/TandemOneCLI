@@ -60,9 +60,10 @@ _UV_PROGRAMS = ("uv", "uvx")
 class UvSetup:
     """Where uv is on the host, so the sandbox can make it available."""
 
-    # The uv programs to mount read-only (empty if they're already visible)
-    programs: tuple[Path, ...]
-    # Their directory, added to PATH (None if it's already on the sandbox's PATH)
+    # Files to mount read-only, as (file on the host, path in the sandbox), so the
+    # uv programs work (empty if they're visible anyway)
+    mounts: tuple[tuple[Path, Path], ...]
+    # Their directory, added to PATH (None if it's on the sandbox's PATH already)
     bin_dir: Path | None
     cache_dir: Path
     python_dir: Path
@@ -79,14 +80,18 @@ def find_uv() -> UvSetup | None:
     if found is None:
         return None
     bin_dir = Path(found).absolute().parent
-    if _is_system_path(bin_dir):
-        programs: tuple[Path, ...] = ()
-        extra_bin_dir = None
-    else:
-        programs = tuple(
-            bin_dir / name for name in _UV_PROGRAMS if (bin_dir / name).is_file()
-        )
-        extra_bin_dir = bin_dir
+    mounts: list[tuple[Path, Path]] = []
+    for program in (bin_dir / name for name in _UV_PROGRAMS):
+        if not program.is_file():
+            continue
+        # A program may be a link to a file elsewhere; both must be visible
+        target = program.resolve()
+        if not _is_system_path(target):
+            mounts.append((target, target))
+        if program != target and not _is_system_path(program):
+            mounts.append((target, program))
+    # Visible isn't enough: /opt, where CI runners install uv, isn't on PATH
+    on_path = str(bin_dir) in SANDBOX_PATH.split(":")
 
     home = Path.home()
     cache_home = os.environ.get("XDG_CACHE_HOME") or home / ".cache"
@@ -96,8 +101,8 @@ def find_uv() -> UvSetup | None:
         os.environ.get("UV_PYTHON_INSTALL_DIR") or Path(data_home) / "uv" / "python"
     )
     return UvSetup(
-        programs=programs,
-        bin_dir=extra_bin_dir,
+        mounts=tuple(mounts),
+        bin_dir=None if on_path else bin_dir,
         cache_dir=Path(cache_dir).absolute(),
         python_dir=Path(python_dir).absolute(),
     )
@@ -134,8 +139,8 @@ def supports_overlay() -> bool:
 def _uv_args(uv: UvSetup) -> list[str]:
     """Return the bwrap options that make uv available in the sandbox."""
     args: list[str] = []
-    for program in uv.programs:
-        args += ["--ro-bind", str(program.resolve()), str(program)]
+    for source, destination in uv.mounts:
+        args += ["--ro-bind", str(source), str(destination)]
     for directory, read_only_fallback in ((uv.cache_dir, False), (uv.python_dir, True)):
         if directory.is_dir() and supports_overlay():
             # Reads come from the real directory, writes go to a throwaway layer
