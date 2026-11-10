@@ -343,7 +343,7 @@ def stream_response(
             headers=headers,
             json=payload,
             stream=True,
-            timeout=300,
+            timeout=600,
         ) as response:
             response.raise_for_status()
             # SSE is always UTF-8, but requests defaults text/* to ISO-8859-1
