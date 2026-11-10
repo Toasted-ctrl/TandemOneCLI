@@ -27,6 +27,10 @@ COMMANDS: tuple[CommandInfo, ...] = (
     CommandInfo("/clear", "Clear the selected provider and model"),
     CommandInfo("/help", "Show this help"),
     CommandInfo("/web", "Toggle web search for the model on or off"),
+    CommandInfo(
+        "/max-tokens <tokens>",
+        "Limit how many tokens the model may reply with; no number resets it",
+    ),
 )
 
 EXIT_COMMAND = CommandInfo("exit", "Quit Tandem One CLI (or press Ctrl+C)")
@@ -49,6 +53,8 @@ class SlashState:
     thread_id: Optional[str] = None
     # Whether the model may search the web; shown next to the prompt when on
     web: bool = False
+    # Most tokens the model may generate per reply; None leaves it to the model
+    max_output_tokens: Optional[int] = None
 
 
 @dataclass
@@ -107,6 +113,9 @@ class SlashHandler:
 
         elif command == "web":
             return self._handle_web_search()
+
+        elif command == "max-tokens":
+            return self._handle_max_tokens(arg)
 
         else:
             return CommandResponse(
@@ -193,3 +202,24 @@ class SlashHandler:
         if self.state.web:
             return CommandResponse("[bold green]✓ Web search enabled[/bold green]")
         return CommandResponse("[dim]Web search disabled[/dim]")
+
+    def _handle_max_tokens(self, arg: Optional[str]) -> CommandResponse:
+        """Handle /max-tokens command: set or reset the max output tokens."""
+        if arg is None:
+            self.state.max_output_tokens = None
+            return CommandResponse(
+                "[dim]Max output tokens reset to the model default[/dim]"
+            )
+
+        try:
+            tokens = int(arg)
+        except ValueError:
+            tokens = 0
+        if tokens < 1:
+            return CommandResponse(
+                f"[red]Error: '{safe_markup(arg)}' is not a whole number of at least 1.[/red]",
+                message_type="error",
+            )
+
+        self.state.max_output_tokens = tokens
+        return CommandResponse(f"Max output tokens: [bold]{tokens}[/bold]")

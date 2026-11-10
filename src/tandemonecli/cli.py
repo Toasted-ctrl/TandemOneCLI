@@ -230,6 +230,7 @@ def run_conversation_turn(
             thread_id=state.thread_id,
             tool_results=tool_results,
             web_search=state.web,
+            max_output_tokens=state.max_output_tokens,
         )
         state.thread_id = result.thread_id
 
@@ -246,7 +247,7 @@ def run_conversation_turn(
 
 
 def build_prompt_text(state: SlashState) -> str:
-    """Build the input prompt: the selected provider/model and a web badge."""
+    """Build the input prompt: the selected provider/model and setting badges."""
     # Names come from the API, so escape them before adding markup
     provider = safe_markup(state.selected_provider or "")
     model = safe_markup(state.selected_model or "")
@@ -262,7 +263,12 @@ def build_prompt_text(state: SlashState) -> str:
 
     # Shown on every prompt so it's always clear the model can go online
     web_badge = "[bold black on green] ✓ web [/bold black on green] "
-    return f"> {context}{web_badge if state.web else ''}"
+    max_tokens_badge = (
+        f"[bold black on yellow] max-tokens {state.max_output_tokens} [/bold black on yellow] "
+        if state.max_output_tokens is not None
+        else ""
+    )
+    return f"> {context}{web_badge if state.web else ''}{max_tokens_badge}"
 
 
 def main():

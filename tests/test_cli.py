@@ -98,7 +98,8 @@ def test_greets_user_and_lists_providers_only(monkeypatch, console, fake_api):
     for model in ("gpt-a", "gpt-b", "claude-a"):
         assert model not in output
     assert (
-        "Commands: /provider <name>, /model <name>, /new, /clear, /help, /web. "
+        "Commands: /provider <name>, /model <name>, /new, /clear, /help, /web, "
+        "/max-tokens <tokens>. "
         "Type /help for details."
     ) in output
 
@@ -193,6 +194,23 @@ def test_web_search_setting_is_sent_with_input(monkeypatch, console, fake_api):
     assert fake_api["stream_response"].call_args.kwargs["web_search"] is True
 
 
+def test_prompt_shows_max_tokens_only_while_set(monkeypatch, console, fake_api):
+    _, fake_prompt = run(
+        monkeypatch, console, ["/max-tokens 512", "/max-tokens", "exit"]
+    )
+
+    before, limited, reset = fake_prompt.prompts
+    assert "max-tokens" not in before
+    assert "max-tokens 512" in limited
+    assert "max-tokens" not in reset
+
+
+def test_max_output_tokens_is_sent_with_input(monkeypatch, console, fake_api):
+    run(monkeypatch, console, [*SELECT_MODEL, "/max-tokens 512", "hello", "exit"])
+
+    assert fake_api["stream_response"].call_args.kwargs["max_output_tokens"] == 512
+
+
 # --- Regular input -----------------------------------------------------------
 
 
@@ -207,6 +225,7 @@ def test_input_is_streamed_to_selected_model(monkeypatch, console, fake_api):
         thread_id=None,
         tool_results=None,
         web_search=False,
+        max_output_tokens=None,
     )
 
 

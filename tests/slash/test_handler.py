@@ -351,3 +351,37 @@ def test_web_toggles_web_search(handler):
     disabled = handler.handle("/web")
     assert handler.state.web is False
     assert "disabled" in disabled.message
+
+
+# --- /max-tokens --------------------------------------------------------------------
+
+
+def test_max_output_tokens_is_unset_by_default(handler):
+    assert handler.state.max_output_tokens is None
+
+
+def test_max_tokens_sets_max_output_tokens(handler):
+    response = handler.handle("/max-tokens 1024")
+
+    assert handler.state.max_output_tokens == 1024
+    assert response.message_type == "normal"
+    assert "1024" in response.message
+
+
+def test_max_tokens_without_number_resets_max_output_tokens(handler):
+    handler.handle("/max-tokens 1024")
+
+    response = handler.handle("/max-tokens")
+
+    assert handler.state.max_output_tokens is None
+    assert "reset" in response.message
+
+
+@pytest.mark.parametrize("arg", ["abc", "0", "-5", "1.5", "[bold]x"])
+def test_max_tokens_rejects_invalid_numbers(handler, arg):
+    handler.handle("/max-tokens 1024")
+
+    response = handler.handle(f"/max-tokens {arg}")
+
+    assert response.message_type == "error"
+    assert handler.state.max_output_tokens == 1024

@@ -167,14 +167,16 @@ sandbox, because it can change that code.
 
 ## Slash commands
 
-| Command             | What it does                                          |
-| ------------------- | ----------------------------------------------------- |
-| `/provider <name>`  | Select a provider and list its models                 |
-| `/model <name>`     | Select a model from the current provider              |
-| `/new`              | Start a new conversation                              |
-| `/clear`            | Clear the current provider and model selection        |
-| `/help`             | Show each command and what it does                    |
-| `exit` or `Ctrl+C`  | Quit the CLI                                          |
+| Command                | What it does                                          |
+| ---------------------- | ----------------------------------------------------- |
+| `/provider <name>`     | Select a provider and list its models                 |
+| `/model <name>`        | Select a model from the current provider              |
+| `/new`                 | Start a new conversation                              |
+| `/clear`               | Clear the current provider and model selection        |
+| `/help`                | Show each command and what it does                    |
+| `/web`                 | Turn web search for the model on or off               |
+| `/max-tokens <tokens>` | Limit the reply length in tokens; no number resets it |
+| `exit` or `Ctrl+C`     | Quit the CLI                                          |
 
 ## Troubleshooting
 

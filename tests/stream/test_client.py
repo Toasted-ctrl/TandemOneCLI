@@ -198,8 +198,20 @@ def test_stream_response_sends_expected_request(monkeypatch, console):
             "prompt": "hello",
         },
         stream=True,
-        timeout=30,
+        timeout=300,
     )
+
+
+def test_stream_response_sends_max_output_tokens(monkeypatch, console):
+    post = fake_post(monkeypatch, [])
+
+    stream_response("key", "hi", "openai", "kimi-k3", max_output_tokens=256)
+
+    assert post.call_args.kwargs["json"]["model"] == {
+        "provider": "openai",
+        "name": "kimi-k3",
+        "parameters": {"max_output_tokens": 256},
+    }
 
 
 def test_stream_response_decodes_as_utf8(monkeypatch, console):

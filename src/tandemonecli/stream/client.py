@@ -280,6 +280,7 @@ def stream_response(
     web_search: bool = False,
     thread_id: str | None = None,
     tool_results: Sequence[ToolResult] | None = None,
+    max_output_tokens: int | None = None,
 ) -> StreamResult:
     """Stream an inference response to the terminal as it arrives.
 
@@ -291,6 +292,8 @@ def stream_response(
         thread_id: ID of the conversation to continue, or None to start a new one
         tool_results: Results of the tool calls the model is waiting on, sent
             instead of a prompt to continue its run (requires thread_id)
+        max_output_tokens: Most tokens the model may generate, or None for the
+            model's default
 
     Returns:
         The thread ID for the next message (None to start a new conversation),
@@ -318,6 +321,8 @@ def stream_response(
         payload["prompt"] = prompt
     if thread_id:
         payload["thread_id"] = thread_id
+    if max_output_tokens is not None:
+        payload["model"]["parameters"] = {"max_output_tokens": max_output_tokens}
 
     # Show a spinner until the first chunk of text arrives
     status = console.status(STATUS_MESSAGE, spinner="dots")
@@ -338,7 +343,7 @@ def stream_response(
             headers=headers,
             json=payload,
             stream=True,
-            timeout=30,
+            timeout=300,
         ) as response:
             response.raise_for_status()
             # SSE is always UTF-8, but requests defaults text/* to ISO-8859-1
