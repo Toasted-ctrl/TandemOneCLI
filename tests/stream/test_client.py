@@ -198,7 +198,7 @@ def test_stream_response_sends_expected_request(monkeypatch, console):
             "prompt": "hello",
         },
         stream=True,
-        timeout=300,
+        timeout=600,
     )
 
 
