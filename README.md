@@ -14,7 +14,7 @@ This project was realized in part with the help of AI.
 
 - Authenticates against SynapseAPI with an API key and greets you by name
 - Fetches the chat-completion models available to you, grouped by provider
-- Interactive prompt with slash commands to select a provider and model
+- Interactive prompt with slash commands, completed as you type, to select a provider and model
 - Streams replies to the terminal as they're generated, with a spinner while you wait,
   and formats them as Markdown: headings, lists, tables and syntax-highlighted code
 - Remembers the conversation, so the model can refer back to earlier messages
@@ -181,6 +181,7 @@ it lets the model run anything inside the sandbox.
 src/tandemonecli/
 ├── cli.py              # Entry point and interactive loop
 ├── config/
+│   ├── defaults.py     # The selection to start with (defaults.json, /set-default)
 │   ├── paths.py        # Where tandemone's config lives (~/.config/tandemone)
 │   └── settings.py     # Settings from ~/.config/tandemone/.env or .env
 ├── startup/
@@ -189,9 +190,11 @@ src/tandemonecli/
 ├── prompts/
 │   └── system.py       # System prompt sent with every message
 ├── slash/
+│   ├── completion.py   # Completes slash commands, providers and models as you type
 │   └── handler.py      # Slash commands, selection and conversation state
 ├── stream/
 │   ├── client.py       # Streams replies and sends tool results to SynapseAPI
+│   ├── footer.py       # Keeps the input line at the bottom while a reply streams
 │   └── markdown.py     # Prints streamed replies as Markdown
 ├── permissions.py      # Which commands run without asking (permissions.json)
 ├── text.py             # Helpers for safely printing untrusted text

@@ -20,6 +20,7 @@ os.environ["SYNAPSE_API_KEY"] = "test-api-key"
 os.environ["SYNAPSE_API_URL"] = "https://synapse.test"
 
 from tandemonecli import permissions  # noqa: E402
+from tandemonecli.config import defaults  # noqa: E402
 from tandemonecli.startup.models import AvailableModels  # noqa: E402
 
 
@@ -28,6 +29,14 @@ def permissions_file(monkeypatch, tmp_path) -> Path:
     """Use a temporary permissions file, never the user's real one."""
     path = tmp_path / "config" / "permissions.json"
     monkeypatch.setattr(permissions, "PERMISSIONS_FILE", path)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def defaults_file(monkeypatch, tmp_path) -> Path:
+    """Use a temporary defaults file, never the user's real one."""
+    path = tmp_path / "config" / "defaults.json"
+    monkeypatch.setattr(defaults, "DEFAULTS_FILE", path)
     return path
 
 

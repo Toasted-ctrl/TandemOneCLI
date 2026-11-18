@@ -3,13 +3,45 @@
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
+from tandemonecli.config.defaults import Defaults, DefaultsError, save_defaults
 from tandemonecli.startup.models import AvailableModels
 from tandemonecli.text import safe_markup
+
+# How commands are shown in help and hints: the command itself, and what you fill in
+COMMAND_STYLE = "bold cyan"
+ARGUMENT_STYLE = "bold magenta"
+
+
+def command_markup(usage: str) -> str:
+    """Show a command's usage, such as ``/model <name>``, in colour.
+
+    The command is cyan and what you fill in is magenta, so it's clear which
+    part you type as is.
+    """
+    name, _, arguments = usage.partition(" ")
+    markup = f"[{COMMAND_STYLE}]{safe_markup(name)}[/{COMMAND_STYLE}]"
+    if arguments:
+        markup += f" [{ARGUMENT_STYLE}]{safe_markup(arguments)}[/{ARGUMENT_STYLE}]"
+    return markup
 
 
 def bullet_list(items: Iterable[str]) -> str:
     """Format items as an indented bullet list, one per line."""
     return "\n".join(f"  • {safe_markup(item)}" for item in items)
+
+
+def selection(defaults: Defaults) -> str:
+    """The provider and model of ``defaults``, in bold, as "provider / model"."""
+    names = " / ".join(
+        safe_markup(name) for name in (defaults.provider, defaults.model) if name
+    )
+    return f"[bold]{names}[/bold]"
+
+
+def describe_defaults(defaults: Defaults) -> str:
+    """Summarise ``defaults`` on one line, for messages."""
+    model = selection(defaults) if defaults.provider else "no model"
+    return f"{model}, web search {'on' if defaults.web else 'off'}"
 
 
 @dataclass(frozen=True)
@@ -31,6 +63,10 @@ COMMANDS: tuple[CommandInfo, ...] = (
         "/max-tokens <tokens>",
         "Limit how many tokens the model may reply with; no number resets it",
     ),
+    CommandInfo(
+        "/set-default",
+        "Start with the current provider, model and web search",
+    ),
 )
 
 EXIT_COMMAND = CommandInfo("exit", "Quit Tandem One CLI (or press Ctrl+C)")
@@ -51,7 +87,7 @@ class SlashState:
     selected_provider: Optional[str] = None
     selected_model: Optional[str] = None
     thread_id: Optional[str] = None
-    # Whether the model may search the web; shown next to the prompt when on
+    # Whether the model may search the web; shown under the input when on
     web: bool = False
     # Most tokens the model may generate per reply; None leaves it to the model
     max_output_tokens: Optional[int] = None
@@ -66,15 +102,15 @@ class SlashHandler:
 
     def get_help(self) -> str:
         """Return a one-line summary of the commands."""
-        usages = ", ".join(f"[bold]{safe_markup(c.usage)}[/bold]" for c in COMMANDS)
-        return f"Commands: {usages}. Type [bold]/help[/bold] for details."
+        usages = ", ".join(command_markup(c.usage) for c in COMMANDS)
+        return f"Commands: {usages}. Type {command_markup('/help')} for details."
 
     def get_detailed_help(self) -> str:
         """Return every command with a description of what it does."""
         commands = (*COMMANDS, EXIT_COMMAND)
         width = max(len(c.usage) for c in commands)
         lines = [
-            f"  [bold]{safe_markup(c.usage)}[/bold]{' ' * (width - len(c.usage))}"
+            f"  {command_markup(c.usage)}{' ' * (width - len(c.usage))}"
             f"   {safe_markup(c.description)}"
             for c in commands
         ]
@@ -117,6 +153,9 @@ class SlashHandler:
         elif command == "max-tokens":
             return self._handle_max_tokens(arg)
 
+        elif command == "set-default":
+            return self._handle_set_default()
+
         else:
             return CommandResponse(
                 f"[red]Unknown command: /{command}[/red]\n{self.get_help()}",
@@ -130,8 +169,30 @@ class SlashHandler:
         return (
             "[bold]Available providers:[/bold]\n"
             f"{bullet_list(self.models.providers)}\n\n"
-            "Select one with [bold]/provider <name>[/bold]"
+            f"Select one with {command_markup('/provider <name>')}"
         )
+
+    def apply_defaults(self, defaults: Defaults) -> Optional[str]:
+        """Start with the saved defaults, and say what was applied, if anything.
+
+        The provider and model are selected only if that model is available now;
+        otherwise neither is, so you never start with half a selection.
+        """
+        if defaults == Defaults():
+            return None
+
+        self.state.web = defaults.web
+        message = f"Using your defaults: {describe_defaults(defaults)}"
+        if defaults.provider and defaults.model:
+            if defaults.model in self.models.providers.get(defaults.provider, []):
+                self.state.selected_provider = defaults.provider
+                self.state.selected_model = defaults.model
+            else:
+                message += (
+                    f"\n[yellow]Your default model {selection(defaults)} isn't "
+                    "available now, so select one with /provider and /model.[/yellow]"
+                )
+        return message
 
     def get_context_prefix(self) -> str:
         """Return a prefix string based on current selection."""
@@ -152,7 +213,7 @@ class SlashHandler:
                 f"Selected provider: [bold]{safe_markup(arg)}[/bold]\n\n"
                 "[bold]Available models:[/bold]\n"
                 f"{bullet_list(self.models.providers[arg])}\n\n"
-                "Select one with [bold]/model <name>[/bold]"
+                f"Select one with {command_markup('/model <name>')}"
             )
         else:
             available = ", ".join(self.models.providers.keys())
@@ -223,3 +284,28 @@ class SlashHandler:
 
         self.state.max_output_tokens = tokens
         return CommandResponse(f"Max output tokens: [bold]{tokens}[/bold]")
+
+    def _handle_set_default(self) -> CommandResponse:
+        """Handle /set-default command: save the current state as the defaults."""
+        if not (self.state.selected_provider and self.state.selected_model):
+            return CommandResponse(
+                "[red]Error: Select a provider and model first, so there's "
+                "something to start with.[/red]",
+                message_type="error",
+            )
+
+        defaults = Defaults(
+            provider=self.state.selected_provider,
+            model=self.state.selected_model,
+            web=self.state.web,
+        )
+        try:
+            save_defaults(defaults)
+        except DefaultsError as e:
+            return CommandResponse(
+                f"[red]Couldn't save the defaults: {safe_markup(str(e))}[/red]",
+                message_type="error",
+            )
+        return CommandResponse(
+            f"[green]Saved as your defaults:[/green] {describe_defaults(defaults)}"
+        )

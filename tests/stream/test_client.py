@@ -5,6 +5,7 @@ import pytest
 import requests
 from rich.console import Console, Group
 from rich.markdown import Markdown
+from rich.text import Text
 
 from tandemonecli.stream import client
 from tandemonecli.stream.client import (
@@ -247,6 +248,15 @@ def test_stream_response_prints_connection_error(monkeypatch, console):
 # --- Spinner -----------------------------------------------------------------
 
 
+def render_lines(renderable) -> list[str]:
+    """The lines a renderable shows, as plain text."""
+    console = Console(width=40, force_terminal=True, height=10)
+    return [
+        "".join(segment.text for segment in line)
+        for line in console.render_lines(renderable, pad=False)
+    ]
+
+
 def describe(renderable) -> str:
     """The text of a printed string or Markdown block."""
     if isinstance(renderable, Group):
@@ -261,11 +271,11 @@ class SpinnerSpy:
 
     def __init__(self, monkeypatch, console: Console):
         self.events: list[str] = []
-        status = MagicMock()
-        status.start.side_effect = lambda: self.events.append("start")
-        status.stop.side_effect = lambda: self.events.append("stop")
-        self.status_call = MagicMock(return_value=status)
-        monkeypatch.setattr(console, "status", self.status_call)
+        spinner = MagicMock()
+        spinner.start.side_effect = lambda: self.events.append("start")
+        spinner.stop.side_effect = lambda: self.events.append("stop")
+        self.thinking_call = MagicMock(return_value=spinner)
+        monkeypatch.setattr(client, "_thinking", self.thinking_call)
 
         original_print = console.print
 
@@ -292,7 +302,95 @@ def test_spinner_starts_before_request(monkeypatch, console, spinner):
     stream_response("key", "hi", "openai", "kimi-k3")
 
     assert spinner.events.index("start") < spinner.events.index("request")
-    spinner.status_call.assert_called_once_with(client.STATUS_MESSAGE, spinner="dots")
+    spinner.thinking_call.assert_called_once_with()
+
+
+# --- Pinned footer -----------------------------------------------------------
+
+
+class FakeFooter:
+    """Stands in for ``PinnedFooter``, recording what it's asked to do."""
+
+    def __init__(self, console, footer):
+        self.footer = footer
+        self.events: list[str] = []
+        self.lines = 4
+
+
+@pytest.fixture
+def footers(monkeypatch) -> list[FakeFooter]:
+    made: list[FakeFooter] = []
+
+    def make(console, footer):
+        fake = FakeFooter(console, footer)
+        for name in ("pin", "refresh", "unpin"):
+            setattr(fake, name, lambda name=name: fake.events.append(name))
+        made.append(fake)
+        return fake
+
+    monkeypatch.setattr(client, "PinnedFooter", make)
+    return made
+
+
+def test_footer_is_pinned_while_the_reply_streams(monkeypatch, console, footers):
+    fake_post(monkeypatch, sse_lines("Hi"))
+    footer = Text("openai / gpt-a")
+
+    stream_response("key", "hi", "openai", "kimi-k3", footer=footer)
+
+    assert footers[0].footer is footer
+    assert footers[0].events[0] == "pin"
+    assert footers[0].events[-1] == "unpin"
+
+
+def test_printer_leaves_room_for_the_pinned_footer(monkeypatch, console, footers):
+    fake_post(monkeypatch, sse_lines("Hi"))
+    printers = []
+    original = client.MarkdownPrinter
+    monkeypatch.setattr(
+        client,
+        "MarkdownPrinter",
+        lambda *a, **kw: printers.append(original(*a, **kw)) or printers[-1],
+    )
+
+    stream_response("key", "hi", "openai", "kimi-k3", footer=Text("x"))
+
+    assert printers[0].reserved_lines == 4
+
+
+def test_footer_is_checked_for_resizes_as_text_arrives(monkeypatch, console, footers):
+    fake_post(monkeypatch, sse_lines("Hi", " there"))
+
+    stream_response("key", "hi", "openai", "kimi-k3", footer=Text("x"))
+
+    assert footers[0].events.count("refresh") == 2
+
+
+@pytest.mark.parametrize(
+    "error",
+    [requests.ConnectionError("unreachable"), KeyboardInterrupt()],
+)
+def test_footer_is_unpinned_when_the_stream_ends_early(
+    monkeypatch, console, footers, error
+):
+    monkeypatch.setattr(client.requests, "post", MagicMock(side_effect=error))
+
+    try:
+        stream_response("key", "hi", "openai", "kimi-k3", footer=Text("x"))
+    except KeyboardInterrupt:
+        pass
+
+    assert footers[0].events == ["pin", "unpin"]
+
+
+def test_footer_is_unpinned_after_an_error_from_the_server(
+    monkeypatch, console, footers
+):
+    fake_post(monkeypatch, [], status_code=500)
+
+    stream_response("key", "hi", "openai", "kimi-k3", footer=Text("x"))
+
+    assert footers[0].events == ["pin", "unpin"]
 
 
 def test_spinner_stops_before_first_text(monkeypatch, console, spinner):

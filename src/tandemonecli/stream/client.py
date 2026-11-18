@@ -6,20 +6,27 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import requests
-from rich.console import Console
+from rich.console import Console, RenderableType
+from rich.live import Live
+from rich.spinner import Spinner
 
 from tandemonecli.config.settings import tocli_settings
 from tandemonecli.prompts.system import SYSTEM_PROMPT
+from tandemonecli.stream.footer import PinnedFooter
 from tandemonecli.stream.markdown import MarkdownPrinter
 from tandemonecli.text import safe_markup
 from tandemonecli.tools.bash import BASH_TOOL_SPEC
 
 STREAM_PATH = "/api/v1/inference/conversation/stream"
 STATUS_MESSAGE = "[bold green]Thinking..."
+# How often the spinner moves, as in Rich's own status spinner
+_SPINNER_REFRESHES_PER_SECOND = 12.5
 CLIENT_TOOLS = [BASH_TOOL_SPEC]
 CLIENT_TOOL_NAMES = frozenset(spec["name"] for spec in CLIENT_TOOLS)
 
-console = Console()
+# No automatic highlighting: it colours whatever looks like a number or path,
+# such as "/model" in a hint, so only the styles set in markup are used
+console = Console(highlight=False)
 
 
 # Longest tool input or error shown in a server tool line, in characters
@@ -272,6 +279,16 @@ def _is_waiting_for_tool_results(error: requests.HTTPError) -> bool:
     return response is not None and response.status_code == 409
 
 
+def _thinking() -> Live:
+    """The spinner shown while the model works."""
+    return Live(
+        Spinner("dots", STATUS_MESSAGE),
+        console=console,
+        refresh_per_second=_SPINNER_REFRESHES_PER_SECOND,
+        transient=True,
+    )
+
+
 def stream_response(
     api_key: str,
     prompt: str | None,
@@ -281,6 +298,7 @@ def stream_response(
     thread_id: str | None = None,
     tool_results: Sequence[ToolResult] | None = None,
     max_output_tokens: int | None = None,
+    footer: RenderableType | None = None,
 ) -> StreamResult:
     """Stream an inference response to the terminal as it arrives.
 
@@ -294,6 +312,9 @@ def stream_response(
             instead of a prompt to continue its run (requires thread_id)
         max_output_tokens: Most tokens the model may generate, or None for the
             model's default
+        footer: Lines kept at the bottom of the terminal while the reply is
+            written, such as the empty input line with the selected provider
+            and model
 
     Returns:
         The thread ID for the next message (None to start a new conversation),
@@ -325,9 +346,11 @@ def stream_response(
         payload["model"]["parameters"] = {"max_output_tokens": max_output_tokens}
 
     # Show a spinner until the first chunk of text arrives
-    status = console.status(STATUS_MESSAGE, spinner="dots")
+    pinned = PinnedFooter(console, footer)
+    pinned.pin()
+    status = _thinking()
     status.start()
-    printer = MarkdownPrinter(console)
+    printer = MarkdownPrinter(console, reserved_lines=pinned.lines)
     chunks: list[str] = []
     tool_calls: list[ToolCall] = []
     failed = False
@@ -385,6 +408,8 @@ def stream_response(
                     chunks.append(content)
                     # The spinner and the reply can't be shown live at once
                     status.stop()
+                    pinned.refresh()
+                    printer.reserved_lines = pinned.lines
                     printer.add(content)
 
             end_output()
@@ -414,6 +439,8 @@ def stream_response(
     finally:
         # Also on Ctrl+C; stopping and finishing twice is harmless
         end_output()
+        # Last, so the input line is drawn where the footer was
+        pinned.unpin()
 
     return StreamResult(
         thread_id=thread_id,

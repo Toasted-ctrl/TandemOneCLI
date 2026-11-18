@@ -1,14 +1,23 @@
+import threading
+import time
 from collections.abc import Iterable
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 from uuid import uuid4
 
 import pytest
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from tandemonecli import cli
+from tandemonecli.config.defaults import Defaults, save_defaults
 from tandemonecli.permissions import Permissions, load_permissions, save_permissions
+from tandemonecli.slash.handler import SlashState
 from tandemonecli.startup.models import AvailableModels
 from tandemonecli.startup.user import User
+from tandemonecli.stream import client
 from tandemonecli.stream.client import StreamResult, ToolCall, ToolResult
 
 
@@ -44,14 +53,17 @@ def fake_api(monkeypatch, available_models) -> dict[str, MagicMock]:
 
 
 class FakePrompt:
-    """Stands in for ``Prompt.ask``, returning or raising each input in turn."""
+    """Stands in for ``read_user_input``, returning or raising each input in turn.
+
+    Records the status line shown under the input at each turn, as plain text.
+    """
 
     def __init__(self, inputs: Iterable[str | type[BaseException]]):
         self.inputs = iter(inputs)
         self.prompts: list[str] = []
 
-    def __call__(self, prompt_text: str, default: str = "") -> str:
-        self.prompts.append(prompt_text)
+    def __call__(self, state, models) -> str:
+        self.prompts.append(fragment_list_to_text(cli.build_status_line(state)))
         item = next(self.inputs)
         if isinstance(item, type) and issubclass(item, BaseException):
             raise item
@@ -60,7 +72,7 @@ class FakePrompt:
 
 def run(monkeypatch, console: Console, inputs) -> tuple[str, FakePrompt]:
     fake_prompt = FakePrompt(inputs)
-    monkeypatch.setattr(cli.Prompt, "ask", fake_prompt)
+    monkeypatch.setattr(cli, "read_user_input", fake_prompt)
     cli.main()
     return console.export_text(), fake_prompt
 
@@ -84,8 +96,14 @@ def test_line_is_drawn_above_every_prompt(monkeypatch, console, fake_api):
     output, prompt = run(monkeypatch, console, ["/help", "exit"])
 
     rules = [line for line in output.splitlines() if set(line) == {"\u2500"}]
-    assert len(rules) == len(prompt.prompts) == 2
-    assert output.rstrip().splitlines()[-2] == rules[-1]
+    # One above and one below each input, which is shown again after Enter
+    assert len(rules) == 2 * len(prompt.prompts) == 4
+    assert output.rstrip().splitlines()[-4:] == [
+        rules[-1],
+        "> exit",
+        rules[-1],
+        "Goodbye!",
+    ]
 
 
 def test_greets_user_and_lists_providers_only(monkeypatch, console, fake_api):
@@ -99,7 +117,7 @@ def test_greets_user_and_lists_providers_only(monkeypatch, console, fake_api):
         assert model not in output
     assert (
         "Commands: /provider <name>, /model <name>, /new, /clear, /help, /web, "
-        "/max-tokens <tokens>. "
+        "/max-tokens <tokens>, /set-default. "
         "Type /help for details."
     ) in output
 
@@ -109,6 +127,74 @@ def test_uses_api_key_from_settings(monkeypatch, console, fake_api):
 
     fake_api["get_user"].assert_called_once_with("secret-key")
     fake_api["get_models"].assert_called_once_with(api_key="secret-key")
+
+
+# --- Defaults ----------------------------------------------------------------
+
+
+def test_starts_with_saved_defaults(monkeypatch, console, fake_api):
+    save_defaults(Defaults(provider="openai", model="gpt-b", web=True))
+
+    output, prompt = run(monkeypatch, console, ["exit"])
+
+    assert "Using your defaults: openai / gpt-b" in output
+    status = prompt.prompts[0]
+    assert status.startswith("openai / gpt-b")
+    assert "✓ web" in status
+    assert "max-tokens" not in status
+
+
+def test_defaults_are_applied_only_after_models_are_loaded(
+    monkeypatch, console, fake_api
+):
+    order = []
+    fake_api["get_models"].side_effect = lambda **_: (
+        order.append("models") or fake_api["get_models"].return_value
+    )
+    apply_defaults = cli.SlashHandler.apply_defaults
+    monkeypatch.setattr(
+        cli.SlashHandler,
+        "apply_defaults",
+        lambda self, defaults: (
+            order.append("defaults") or apply_defaults(self, defaults)
+        ),
+    )
+
+    run(monkeypatch, console, ["exit"])
+
+    assert order == ["models", "defaults"]
+
+
+def test_unavailable_default_model_is_not_selected(monkeypatch, console, fake_api):
+    save_defaults(Defaults(provider="openai", model="gpt-gone", web=True))
+
+    output, prompt = run(monkeypatch, console, ["exit"])
+
+    assert "isn't available now" in output
+    assert prompt.prompts[0].startswith("no provider yet")
+    assert "✓ web" in prompt.prompts[0]
+
+
+def test_broken_defaults_file_is_reported_not_fatal(
+    monkeypatch, console, fake_api, defaults_file
+):
+    defaults_file.parent.mkdir(parents=True, exist_ok=True)
+    defaults_file.write_text("not json", encoding="utf-8")
+
+    output, prompt = run(monkeypatch, console, ["exit"])
+
+    assert "Not using your defaults, because" in output
+    assert prompt.prompts[0].startswith("no provider yet")
+    assert output.rstrip().endswith("Goodbye!")
+
+
+def test_set_default_then_restart_uses_it(monkeypatch, console, fake_api):
+    run(monkeypatch, console, [*SELECT_MODEL, "/web", "/set-default", "exit"])
+
+    _, prompt = run(monkeypatch, console, ["exit"])
+
+    assert prompt.prompts[0].startswith("openai / gpt-a")
+    assert "✓ web" in prompt.prompts[0]
 
 
 # --- Exiting -----------------------------------------------------------------
@@ -156,21 +242,22 @@ def test_slash_command_is_not_streamed(monkeypatch, console, fake_api):
     fake_api["stream_response"].assert_not_called()
 
 
-# --- Prompt text -------------------------------------------------------------
+# --- Status line -------------------------------------------------------------
 
 
-def test_prompt_shows_current_selection(monkeypatch, console, fake_api):
+def test_status_line_shows_current_selection(monkeypatch, console, fake_api):
     _, fake_prompt = run(monkeypatch, console, [*SELECT_MODEL, "exit"])
 
     no_selection, provider_only, provider_and_model = fake_prompt.prompts
-    assert no_selection == "> "
+    assert "no provider yet" in no_selection
     assert "openai" in provider_only
+    assert "no model yet" in provider_only
     assert "gpt-a" not in provider_only
     assert "openai" in provider_and_model
     assert "gpt-a" in provider_and_model
 
 
-def test_prompt_shows_web_badge_only_while_web_search_is_on(
+def test_status_line_shows_web_badge_only_while_web_search_is_on(
     monkeypatch, console, fake_api
 ):
     _, fake_prompt = run(monkeypatch, console, ["/web", "/web", "exit"])
@@ -181,7 +268,7 @@ def test_prompt_shows_web_badge_only_while_web_search_is_on(
     assert "web" not in disabled
 
 
-def test_prompt_shows_web_badge_after_selection(monkeypatch, console, fake_api):
+def test_status_line_shows_web_badge_after_selection(monkeypatch, console, fake_api):
     _, fake_prompt = run(monkeypatch, console, [*SELECT_MODEL, "/web", "exit"])
 
     prompt = fake_prompt.prompts[-1]
@@ -194,7 +281,7 @@ def test_web_search_setting_is_sent_with_input(monkeypatch, console, fake_api):
     assert fake_api["stream_response"].call_args.kwargs["web_search"] is True
 
 
-def test_prompt_shows_max_tokens_only_while_set(monkeypatch, console, fake_api):
+def test_status_line_shows_max_tokens_only_while_set(monkeypatch, console, fake_api):
     _, fake_prompt = run(
         monkeypatch, console, ["/max-tokens 512", "/max-tokens", "exit"]
     )
@@ -226,7 +313,26 @@ def test_input_is_streamed_to_selected_model(monkeypatch, console, fake_api):
         tool_results=None,
         web_search=False,
         max_output_tokens=None,
+        footer=ANY,
     )
+
+
+def test_empty_input_line_is_shown_while_the_reply_streams(
+    monkeypatch, console, fake_api
+):
+    run(monkeypatch, console, [*SELECT_MODEL, "/web", "hello", "exit"])
+
+    footer = fake_api["stream_response"].call_args.kwargs["footer"]
+    lines = [
+        "".join(segment.text for segment in line).rstrip()
+        for line in console.render_lines(footer, pad=False)
+    ]
+    # Just like the input line: a rule, an empty prompt, a rule, the status line
+    assert len(lines) == 4
+    assert set(lines[0]) == set(lines[2]) == {"\u2500"}
+    assert lines[1] == ">"
+    assert lines[3].startswith("openai / gpt-a")
+    assert "✓ web" in lines[3]
 
 
 def test_empty_input_is_ignored(monkeypatch, console, fake_api):
@@ -365,13 +471,195 @@ def test_greeting_escapes_user_name(monkeypatch, console, fake_api):
     assert "\x1b" not in output
 
 
-def test_prompt_escapes_provider_and_model_names(monkeypatch, console, fake_api):
-    fake_api["get_models"].return_value = AvailableModels(providers={"[x]": ["m[b]"]})
+def test_status_line_strips_control_characters_from_names(
+    monkeypatch, console, fake_api
+):
+    fake_api["get_models"].return_value = AvailableModels(
+        providers={"[x]\x1b[2J": ["m[b]\x07"]}
+    )
 
-    _, fake_prompt = run(monkeypatch, console, ["/provider [x]", "/model m[b]", "exit"])
+    _, fake_prompt = run(
+        monkeypatch, console, ["/provider [x]\x1b[2J", "/model m[b]\x07", "exit"]
+    )
 
-    assert "\\[x]" in fake_prompt.prompts[1]
-    assert "m\\[b]" in fake_prompt.prompts[2]
+    # Shown as text, so brackets stay; escape sequences can't reach the terminal
+    assert "[x]" in fake_prompt.prompts[1]
+    assert "m[b]" in fake_prompt.prompts[2]
+    assert "\x1b" not in fake_prompt.prompts[2]
+    assert "\x07" not in fake_prompt.prompts[2]
+
+
+# --- Input line --------------------------------------------------------------
+
+
+def type_into_input_line(
+    *steps: str,
+    state: SlashState | None = None,
+    models: AvailableModels | None = None,
+):
+    """Run one input line on a fake terminal, as if each step were typed in turn.
+
+    Completions are found in the background, so steps are typed with a pause in
+    between, like a person would, for the menu to be filled before the next key.
+    """
+    with create_pipe_input() as pipe:
+
+        def type_steps() -> None:
+            for step in steps:
+                time.sleep(0.05 if step else cli.ESCAPE_DELAY + 0.2)
+                pipe.send_text(step)
+
+        typist = threading.Thread(target=type_steps)
+        typist.start()
+        try:
+            with create_app_session(input=pipe, output=DummyOutput()):
+                line = cli.InputLine()
+                answer = line.ask(state or SlashState(), models or AvailableModels({}))
+        finally:
+            typist.join()
+        return line, answer
+
+
+TAB = "\t"
+ENTER = "\r"
+# Nothing typed for longer than the input line waits to see if Esc starts a key's
+# code, so a lone Esc counts as Esc
+PAUSE = ""
+
+
+def test_tab_and_enter_complete_and_run_a_command():
+    _, answer = type_into_input_line("/we", TAB, ENTER)
+
+    assert answer == "/web"
+
+
+def test_arrow_keys_pick_from_the_menu():
+    down = "\x1b[B"
+
+    # The arrow key's code starts with Esc, but is still read as one key
+    _, answer = type_into_input_line("/n", down, ENTER)
+
+    assert answer == "/new"
+
+
+def test_command_that_needs_an_argument_lists_its_choices(available_models):
+    # Enter on /provider doesn't send it, but lists the providers to pick from
+    _, answer = type_into_input_line(
+        "/pro", TAB, ENTER, TAB, ENTER, models=available_models
+    )
+
+    assert answer == "/provider openai"
+
+
+def test_model_is_completed_from_the_selected_provider(available_models):
+    state = SlashState(selected_provider="anthropic")
+
+    _, answer = type_into_input_line(
+        "/model ", TAB, ENTER, state=state, models=available_models
+    )
+
+    assert answer == "/model claude-a"
+
+
+def test_escape_closes_the_menu_and_keeps_what_you_typed(available_models):
+    _, answer = type_into_input_line(
+        "/pro", TAB, "\x1b", PAUSE, ENTER, models=available_models
+    )
+
+    # Tab had filled in /provider; Esc puts back what you typed
+    assert answer == "/pro"
+
+
+def test_escape_closes_the_menu_right_away(available_models):
+    # The x comes well within the second prompt_toolkit would otherwise wait
+    # for a key combination starting with Esc, and is still typed as an x
+    _, answer = type_into_input_line(
+        "/provider ", "\x1b", PAUSE, "x", ENTER, models=available_models
+    )
+
+    assert answer == "/provider x"
+
+
+def test_enter_sends_what_you_typed_if_no_completion_is_picked():
+    models = AvailableModels({"openai": ["gpt-a-mini", "gpt-a"]})
+    state = SlashState(selected_provider="openai")
+
+    # gpt-a-mini also matches, and comes first, but wasn't picked
+    _, answer = type_into_input_line("/model gpt-a", ENTER, state=state, models=models)
+
+    assert answer == "/model gpt-a"
+
+
+def test_input_line_completes_with_the_models_passed_to_ask(available_models):
+    line, _ = type_into_input_line(ENTER, models=available_models)
+
+    assert line.models is available_models
+
+
+def test_input_line_returns_what_you_typed():
+    line, answer = type_into_input_line("hello there\r")
+
+    assert answer == "hello there"
+    # Kept for the next line, which can recall it with the up arrow
+    assert line.buffer.history.get_strings() == ["hello there"]
+
+
+def test_input_line_is_erased_when_you_press_enter():
+    line, _ = type_into_input_line("hello there\r")
+
+    # The main loop shows your input instead, so it isn't on screen twice
+    assert line.app.erase_when_done
+
+
+def test_message_is_shown_once_as_you(monkeypatch, console, fake_api):
+    output, _ = run(monkeypatch, console, [*SELECT_MODEL, "hello there", "exit"])
+
+    assert output.count("hello there") == 1
+    assert "You: hello there" in output
+    assert "> hello there" not in output
+    # A line above, but only a blank line before the reply: the bar is enough
+    lines = output.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("You: hello"))
+    assert set(lines[at - 1]) == {"\u2500"}
+    assert lines[at + 1] == ""
+
+
+def test_command_is_shown_as_typed(monkeypatch, console, fake_api):
+    output, _ = run(monkeypatch, console, ["/provider openai", "hello", "exit"])
+
+    assert "> /provider openai" in output
+    # Without a model, input isn't sent, so it isn't shown as your message
+    assert "> hello" in output
+    assert "You:" not in output
+    assert "> exit" in output
+
+
+def test_input_line_layout_keeps_the_input_at_the_bottom():
+    line = cli.InputLine()
+    windows = line.app.layout.container.get_children()
+
+    # Empty space, the completion menu, the input between two lines, then the
+    # status line, so the input stays at the bottom
+    assert isinstance(windows[1].content.content, cli.CompletionsMenuControl)
+    assert windows[2].char == windows[4].char == "\u2500"
+    assert isinstance(windows[3].content, cli.BufferControl)
+
+
+def test_input_line_raises_keyboard_interrupt_on_ctrl_c():
+    with pytest.raises(KeyboardInterrupt):
+        type_into_input_line("half a message\x03")
+
+
+def test_input_line_raises_eof_error_on_ctrl_d_when_empty():
+    with pytest.raises(EOFError):
+        type_into_input_line("\x04")
+
+
+def test_ctrl_d_deletes_a_character_while_you_are_typing():
+    _, answer = type_into_input_line("abc\x01\x04\r")
+
+    # Ctrl+A moves to the start, so Ctrl+D deletes the "a" instead of quitting
+    assert answer == "bc"
 
 
 # --- Bash commands -----------------------------------------------------------
@@ -833,3 +1121,16 @@ def test_rule_that_cant_be_saved_still_runs_the_command(
 
     assert "Couldn't save the rule: can't save permissions.json" in output
     fake_bash.assert_called_once_with("make test", cli.ROOT)
+
+
+# --- Colours -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("module", [cli, client])
+@pytest.mark.parametrize(
+    "text",
+    ["Select one with /model <name>", "Max output tokens: 1024", "gpt-4.1"],
+)
+def test_text_is_not_highlighted_automatically(module, text):
+    # Only colours set in markup, so the replies to every command look alike
+    assert module.console.render_str(text).spans == []

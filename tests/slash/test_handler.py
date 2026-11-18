@@ -1,6 +1,8 @@
 import pytest
 from rich.console import Console
 
+from tandemonecli.config import defaults
+from tandemonecli.config.defaults import Defaults, load_defaults
 from tandemonecli.slash.handler import (
     COMMANDS,
     EXIT_COMMAND,
@@ -8,8 +10,16 @@ from tandemonecli.slash.handler import (
     SlashHandler,
     SlashState,
     bullet_list,
+    command_markup,
 )
 from tandemonecli.startup.models import AvailableModels
+
+
+def plain(markup: str) -> str:
+    """The text that ``markup`` shows, without its styles."""
+    console = Console(record=True, width=200, force_terminal=False)
+    console.print(markup)
+    return console.export_text()
 
 
 @pytest.fixture
@@ -63,6 +73,39 @@ def test_get_help_lists_all_commands(handler):
         assert command in help_text
 
 
+# --- Command colours ---------------------------------------------------------
+
+
+def test_command_is_cyan_and_argument_magenta():
+    assert command_markup("/model <name>") == (
+        "[bold cyan]/model[/bold cyan] [bold magenta]<name>[/bold magenta]"
+    )
+
+
+def test_command_without_argument_has_no_magenta():
+    assert command_markup("/web") == "[bold cyan]/web[/bold cyan]"
+
+
+def test_command_colours_render(handler):
+    console = Console(record=True, width=200, force_terminal=True, highlight=False)
+    console.print(handler.get_help())
+    styled = console.export_text(styles=True)
+
+    assert "\x1b[1;36m/model\x1b[0m" in styled
+    assert "\x1b[1;35m<name>\x1b[0m" in styled
+
+
+def test_every_usage_shown_is_coloured(handler):
+    texts = [
+        handler.get_help(),
+        handler.get_detailed_help(),
+        handler.get_providers_overview(),
+        handler.handle("/provider openai").message,
+    ]
+    for text in texts:
+        assert "[bold]/" not in text
+
+
 # --- /provider ---------------------------------------------------------------
 
 
@@ -73,7 +116,7 @@ def test_provider_selects_provider_and_lists_models(handler):
     assert response.message_type == "normal"
     assert "Selected provider: [bold]openai[/bold]" in response.message
     assert "  • gpt-a\n  • gpt-b" in response.message
-    assert "/model <name>" in response.message
+    assert command_markup("/model <name>") in response.message
     assert handler.state.selected_provider == "openai"
 
 
@@ -253,7 +296,7 @@ def test_providers_overview_lists_providers_only(handler):
 
     assert "Available providers:" in overview
     assert "  • openai\n  • anthropic" in overview
-    assert "/provider <name>" in overview
+    assert "/provider <name>" in plain(overview)
     for model in ("gpt-a", "gpt-b", "claude-a"):
         assert model not in overview
 
@@ -288,8 +331,10 @@ def test_detailed_help_describes_every_command(handler):
     help_text = handler.get_detailed_help()
 
     for command in (*COMMANDS, EXIT_COMMAND):
-        assert command.usage in help_text
+        assert command.usage in plain(help_text)
         assert command.description in help_text
+        # The description stays in the default colour
+        assert f"   {command.description}" in help_text
 
 
 def test_detailed_help_aligns_descriptions():
@@ -308,8 +353,9 @@ def test_short_help_lists_every_command_and_points_to_help(handler):
     help_text = handler.get_help()
 
     for command in COMMANDS:
-        assert command.usage in help_text
-    assert "Type [bold]/help[/bold] for details." in help_text
+        assert command.usage in plain(help_text)
+    assert "Type /help for details." in plain(help_text)
+    assert f"Type {command_markup('/help')} for details." in help_text
 
 
 def test_every_listed_command_is_handled(handler):
@@ -385,3 +431,92 @@ def test_max_tokens_rejects_invalid_numbers(handler, arg):
 
     assert response.message_type == "error"
     assert handler.state.max_output_tokens == 1024
+
+
+# --- Defaults ----------------------------------------------------------------
+
+
+def select_gpt_a(handler: SlashHandler) -> None:
+    handler.handle("/provider openai")
+    handler.handle("/model gpt-a")
+
+
+def test_set_default_saves_current_state(handler):
+    select_gpt_a(handler)
+    handler.handle("/web")
+    handler.handle("/max-tokens 2048")
+
+    response = handler.handle("/set-default")
+
+    assert response.message_type == "normal"
+    assert "openai / gpt-a" in response.message
+    # The max tokens aren't saved: another model may not support as many
+    assert load_defaults() == Defaults(provider="openai", model="gpt-a", web=True)
+    assert "max tokens" not in response.message
+
+
+@pytest.mark.parametrize("commands", [[], ["/provider openai"]])
+def test_set_default_needs_a_model(handler, defaults_file, commands):
+    for command in commands:
+        handler.handle(command)
+
+    response = handler.handle("/set-default")
+
+    assert response.message_type == "error"
+    assert "Select a provider and model first" in response.message
+    assert not defaults_file.exists()
+
+
+def test_set_default_reports_when_it_cant_save(handler, monkeypatch, tmp_path):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(defaults, "DEFAULTS_FILE", blocker / "defaults.json")
+    select_gpt_a(handler)
+
+    response = handler.handle("/set-default")
+
+    assert response.message_type == "error"
+    assert "Couldn't save the defaults" in response.message
+
+
+def test_empty_defaults_change_nothing(handler):
+    assert handler.apply_defaults(Defaults()) is None
+    assert handler.state == SlashState()
+
+
+def test_defaults_select_an_available_model(handler):
+    message = handler.apply_defaults(
+        Defaults(provider="anthropic", model="claude-a", web=True)
+    )
+
+    assert handler.state == SlashState(
+        selected_provider="anthropic",
+        selected_model="claude-a",
+        web=True,
+    )
+    assert message is not None
+    assert "anthropic / claude-a" in message
+    assert "web search on" in message
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [("openai", "gpt-gone"), ("gone", "gpt-a"), ("anthropic", "gpt-a")],
+)
+def test_defaults_skip_an_unavailable_model(handler, provider, model):
+    message = handler.apply_defaults(Defaults(provider=provider, model=model, web=True))
+
+    # Neither is selected, but the other settings still apply
+    assert handler.state.selected_provider is None
+    assert handler.state.selected_model is None
+    assert handler.state.web is True
+    assert message is not None
+    assert "isn't available now" in message
+
+
+def test_defaults_escape_names_in_messages(handler):
+    message = handler.apply_defaults(Defaults(provider="[red]x", model="[bold]y"))
+
+    assert message is not None
+    assert "\\[red]x" in message
+    assert "\\[bold]y" in message

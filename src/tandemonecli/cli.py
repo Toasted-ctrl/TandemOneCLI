@@ -1,7 +1,32 @@
-from rich.console import Console
+from functools import cache
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import has_completions, is_done
+from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+from prompt_toolkit.layout import (
+    BufferControl,
+    ConditionalContainer,
+    FormattedTextControl,
+    HSplit,
+    Layout,
+    Window,
+)
+from prompt_toolkit.layout.containers import WindowRenderInfo
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.margins import ScrollbarMargin
+from prompt_toolkit.layout.menus import CompletionsMenuControl
+from prompt_toolkit.layout.processors import BeforeInput
+from prompt_toolkit.styles import Style
+from rich.console import Console, Group
 from rich.prompt import Prompt
+from rich.rule import Rule
 from rich.text import Text
 
+from tandemonecli.config.defaults import DefaultsError, load_defaults
 from tandemonecli.config.settings import tocli_settings
 from tandemonecli.permissions import (
     PermissionsError,
@@ -10,8 +35,9 @@ from tandemonecli.permissions import (
     load_permissions,
     suggest_rule,
 )
-from tandemonecli.slash.handler import SlashHandler, SlashState
-from tandemonecli.startup.models import get_models
+from tandemonecli.slash.completion import SlashCompleter
+from tandemonecli.slash.handler import SlashHandler, SlashState, command_markup
+from tandemonecli.startup.models import AvailableModels, get_models
 from tandemonecli.startup.user import get_user
 from tandemonecli.stream.client import ToolCall, ToolResult, stream_response
 from tandemonecli.text import safe_markup, show_control_chars, strip_control_chars
@@ -26,14 +52,55 @@ from tandemonecli.tools.bash import (
 from tandemonecli.tools.sandbox import sandbox_problem
 from tandemonecli.workspace import ROOT
 
-console = Console()
+# No automatic highlighting: it colours whatever looks like a number or path,
+# such as "/model" in a hint, so only the styles set in markup are used
+console = Console(highlight=False)
 
 # Lines of command output shown in the terminal, each cut to the terminal's
 # width; the model gets all of it
 OUTPUT_PREVIEW_LINES = 5
 
+# Most completions shown at once; more than there are commands, so they all fit
+MENU_HEIGHT = 10
+
+# Seconds to wait after Esc for the rest of a key's code
+ESCAPE_DELAY = 0.1
+
 # Style of your echoed message; plain on basic terminals
 USER_STYLE = "grey70 on grey15"
+
+# Colours of the input line, drawn by prompt_toolkit. The status line is also
+# drawn by Rich under a streaming reply, in the same colours (STATUS_COLOURS).
+INPUT_STYLE = Style.from_dict(
+    {
+        "status.provider": "bold ansicyan",
+        "status.model": "bold ansimagenta",
+        "status.hint": "ansibrightblack",
+        "status.web": "bold ansiblack bg:ansigreen",
+        "status.tokens": "bold ansiblack bg:ansiyellow",
+        # The line between the input and the status line, like the one above
+        "rule": "dim",
+        # The completion menu in the terminal's own colours, instead of
+        # prompt_toolkit's grey ones, with commands and what you fill in
+        # coloured as in /help, and the picked one reversed
+        "completion-menu": "noinherit",
+        "completion-menu.completion": "noinherit",
+        "completion-menu.completion.current": "noinherit reverse",
+        "completion-menu.meta.completion": "noinherit",
+        "completion-menu.meta.completion.current": "noinherit reverse",
+        "completion.command": "bold ansicyan",
+        "completion.argument": "bold ansimagenta",
+        "scrollbar.background": "noinherit",
+        "scrollbar.button": "bg:ansibrightblack",
+    }
+)
+STATUS_COLOURS = {
+    "provider": "bold cyan",
+    "model": "bold magenta",
+    "hint": "dim",
+    "web": "bold black on green",
+    "tokens": "bold black on yellow",
+}
 
 
 class ApprovalPrompt(Prompt):
@@ -210,6 +277,22 @@ def show_user_message(user_input: str) -> None:
     console.print()
 
 
+def show_input(user_input: str) -> None:
+    """Echo input that isn't a message, such as a slash command, as you typed it."""
+    console.print(Text(f"> {strip_control_chars(user_input)}"))
+
+
+def is_message(user_input: str, state: SlashState) -> bool:
+    """Whether ``user_input`` goes to the model, rather than being a command."""
+    return bool(
+        user_input
+        and user_input.lower() != "exit"
+        and not user_input.startswith("/")
+        and state.selected_provider
+        and state.selected_model
+    )
+
+
 def run_conversation_turn(
     state: SlashState, user_input: str, provider: str, model_name: str
 ) -> None:
@@ -231,6 +314,7 @@ def run_conversation_turn(
             tool_results=tool_results,
             web_search=state.web,
             max_output_tokens=state.max_output_tokens,
+            footer=input_placeholder(state),
         )
         state.thread_id = result.thread_id
 
@@ -246,29 +330,213 @@ def run_conversation_turn(
         prompt = None
 
 
-def build_prompt_text(state: SlashState) -> str:
-    """Build the input prompt: the selected provider/model and setting badges."""
-    # Names come from the API, so escape them before adding markup
-    provider = safe_markup(state.selected_provider or "")
-    model = safe_markup(state.selected_model or "")
-    if state.selected_model:
-        context = (
-            f"[ [bold cyan]{provider}[/bold cyan] / "
-            f"[bold magenta]{model}[/bold magenta] ] "
-        )
-    elif state.selected_provider:
-        context = f"[ [bold cyan]{provider}[/bold cyan] ] "
-    else:
-        context = ""
+def status_parts(state: SlashState) -> list[tuple[str, str]]:
+    """The pieces of the status line: the name of a colour and the text.
 
-    # Shown on every prompt so it's always clear the model can go online
-    web_badge = "[bold black on green] ✓ web [/bold black on green] "
-    max_tokens_badge = (
-        f"[bold black on yellow] max-tokens {state.max_output_tokens} [/bold black on yellow] "
-        if state.max_output_tokens is not None
-        else ""
+    Names come from the API, so their control characters are removed before
+    they are shown.
+    """
+    parts: list[tuple[str, str]] = []
+    if state.selected_provider:
+        parts.append(("provider", strip_control_chars(state.selected_provider)))
+        if state.selected_model:
+            parts.append(("hint", " / "))
+            parts.append(("model", strip_control_chars(state.selected_model)))
+        else:
+            parts.append(("hint", "  no model yet — /model <name>"))
+    else:
+        parts.append(("hint", "no provider yet — /provider <name>"))
+
+    # Shown the whole time, so it's always clear the model can go online
+    if state.web:
+        parts.append(("", "  "))
+        parts.append(("web", " ✓ web "))
+    if state.max_output_tokens is not None:
+        parts.append(("", "  "))
+        parts.append(("tokens", f" max-tokens {state.max_output_tokens} "))
+    return parts
+
+
+def build_status_line(state: SlashState) -> StyleAndTextTuples:
+    """Build the status line under the input, for prompt_toolkit."""
+    return [
+        (f"class:status.{name}" if name else "", text)
+        for name, text in status_parts(state)
+    ]
+
+
+def status_renderable(state: SlashState) -> Text:
+    """Build the same status line for Rich, to keep under the reply it writes."""
+    line = Text(no_wrap=True, overflow="ellipsis")
+    for name, text in status_parts(state):
+        line.append(text, style=STATUS_COLOURS.get(name, ""))
+    return line
+
+
+class ScrollbarWhenNeeded(ScrollbarMargin):
+    """A scrollbar only when there's more than fits, rather than always."""
+
+    def create_margin(
+        self, window_render_info: WindowRenderInfo, width: int, height: int
+    ) -> StyleAndTextTuples:
+        if window_render_info.content_height <= window_render_info.window_height:
+            return []
+        return super().create_margin(window_render_info, width, height)
+
+
+def completion_menu() -> ConditionalContainer:
+    """The menu of completions, shown above the input while there are any.
+
+    Like prompt_toolkit's ``CompletionsMenu``, but part of the layout rather
+    than floating over it, and with a scrollbar only when not everything fits.
+    """
+    return ConditionalContainer(
+        Window(
+            CompletionsMenuControl(),
+            height=Dimension(min=1, max=MENU_HEIGHT),
+            right_margins=[ScrollbarWhenNeeded()],
+            dont_extend_width=True,
+            # As tall as the completions, so the empty space goes above it
+            dont_extend_height=True,
+            style="class:completion-menu",
+        ),
+        filter=has_completions & ~is_done,
     )
-    return f"> {context}{web_badge if state.web else ''}{max_tokens_badge}"
+
+
+def input_placeholder(state: SlashState) -> Group:
+    """The input line as it looks while empty, to keep under a streaming reply.
+
+    So the input stays in its place while the reply is written, instead of
+    disappearing until it's done.
+    """
+    return Group(
+        Rule(style="dim"),
+        Text("> "),
+        Rule(style="dim"),
+        status_renderable(state),
+    )
+
+
+class InputLine:
+    """The input line between two rules, with the status line under it.
+
+    They sit at the bottom of the terminal, as while a reply streams in (see
+    ``input_placeholder``): prompt_toolkit uses the rows from the cursor down,
+    and the empty space goes above them. Slash commands are completed as you
+    type, in a menu that opens upwards from the input (see ``SlashCompleter``),
+    so the input stays where it is. Pick a completion with Tab or the arrow keys
+    and press Enter to use it; Esc closes the menu.
+
+    It's all erased when you press Enter, so the main loop can show your input
+    once, in the style that fits it (see ``show_user_message``).
+    """
+
+    def __init__(self) -> None:
+        self.state = SlashState()
+        self.models = AvailableModels(providers={})
+        self.buffer = Buffer(
+            multiline=False,
+            history=InMemoryHistory(),
+            completer=SlashCompleter(lambda: self.models, lambda: self.state),
+            complete_while_typing=True,
+        )
+        self.app: Application[str] = Application(
+            layout=Layout(
+                HSplit(
+                    [
+                        # Takes the rows not needed, to keep the rest at the bottom
+                        Window(),
+                        completion_menu(),
+                        Window(char="─", height=1, style="class:rule"),
+                        Window(
+                            BufferControl(
+                                self.buffer, input_processors=[BeforeInput("> ")]
+                            ),
+                            wrap_lines=True,
+                            dont_extend_height=True,
+                        ),
+                        Window(char="─", height=1, style="class:rule"),
+                        ConditionalContainer(
+                            Window(
+                                FormattedTextControl(
+                                    lambda: build_status_line(self.state)
+                                ),
+                                height=1,
+                            ),
+                            filter=~is_done,
+                        ),
+                    ]
+                )
+            ),
+            key_bindings=self._key_bindings(),
+            style=INPUT_STYLE,
+            erase_when_done=True,
+        )
+        # How long to wait to tell Esc from the start of a key's code, such as an
+        # arrow key's; terminals send those at once, so this is plenty, and Esc
+        # closes the menu without a noticeable delay (the default is 0.5 s)
+        self.app.ttimeoutlen = ESCAPE_DELAY
+
+    def ask(self, state: SlashState, models: AvailableModels) -> str:
+        """Read one line, with ``state`` shown under it and ``models`` to complete.
+
+        Raises ``KeyboardInterrupt`` on Ctrl+C and ``EOFError`` on Ctrl+D, like
+        the prompts of Rich, so the main loop can end the same way.
+        """
+        self.state = state
+        self.models = models
+        self.buffer.reset()
+        return self.app.run()
+
+    def _key_bindings(self) -> KeyBindings:
+        """Bind the keys that end the input; the rest are prompt_toolkit's own."""
+        keys = KeyBindings()
+
+        @keys.add("enter")
+        def _accept(event: KeyPressEvent) -> None:
+            # A completion you picked is used, rather than sending what's typed
+            completion = self.buffer.complete_state and (
+                self.buffer.complete_state.current_completion
+            )
+            if completion:
+                self.buffer.apply_completion(completion)
+                if self.buffer.text.endswith(" "):
+                    # The command needs an argument: list its choices instead
+                    self.buffer.start_completion()
+                    return
+            self.buffer.append_to_history()
+            event.app.exit(result=self.buffer.text)
+
+        # Eager: don't wait to see if Esc starts a key combination such as Alt+B
+        @keys.add("escape", filter=has_completions, eager=True)
+        def _close_menu(event: KeyPressEvent) -> None:
+            self.buffer.cancel_completion()
+
+        @keys.add("c-c")
+        def _interrupt(event: KeyPressEvent) -> None:
+            event.app.exit(exception=KeyboardInterrupt, style="class:aborting")
+
+        @keys.add("c-d")
+        def _end_of_input(event: KeyPressEvent) -> None:
+            # Ctrl+D quits on an empty line, and deletes a character otherwise
+            if self.buffer.text:
+                self.buffer.delete()
+            else:
+                event.app.exit(exception=EOFError, style="class:exiting")
+
+        return keys
+
+
+@cache
+def input_line() -> InputLine:
+    """The one input line, so it remembers what you typed earlier (↑ recalls it)."""
+    return InputLine()
+
+
+def read_user_input(state: SlashState, models: AvailableModels) -> str:
+    """Ask for your next message, with the status line under the input."""
+    return input_line().ask(state, models)
 
 
 def main():
@@ -296,18 +564,37 @@ def main():
     console.print(slash_handler.get_providers_overview())
 
     console.print(
-        "\nPress [bold]Ctrl+C[/bold] to exit, or type [bold]exit[/bold] to exit."
+        f"\nPress [bold]Ctrl+C[/bold] to exit, or type {command_markup('exit')} "
+        "to exit."
     )
     console.print(slash_handler.get_help())
+
+    # Only now that the models are known, so an unavailable one isn't selected
+    try:
+        defaults = load_defaults()
+    except DefaultsError as e:
+        console.print(
+            f"\n[yellow]Not using your defaults, because {safe_markup(str(e))}[/yellow]"
+        )
+    else:
+        if message := slash_handler.apply_defaults(defaults):
+            console.print(f"\n{message}")
 
     while True:
         try:
             state = slash_handler.state
-            prompt_text = build_prompt_text(state)
 
-            # A line above the prompt sets your input apart from the output
+            user_input = read_user_input(state, slash_handler.models).strip()
+
+            # The input line is erased on Enter, so your input is shown only once,
+            # with the line that was above it setting it apart from the output
             console.rule(style="dim")
-            user_input = Prompt.ask(prompt_text, default="").strip()
+            if is_message(user_input, state):
+                show_user_message(user_input)
+            else:
+                # A plain line, so a rule sets it apart from the command's output
+                show_input(user_input)
+                console.rule(style="dim")
 
             if user_input.lower() == "exit":
                 console.print("Goodbye!")
@@ -322,7 +609,6 @@ def main():
             # Regular input (not a command)
             if user_input:
                 if state.selected_provider and state.selected_model:
-                    show_user_message(user_input)
                     # Continue the current conversation, if there is one
                     run_conversation_turn(
                         state,

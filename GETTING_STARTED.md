@@ -114,7 +114,10 @@ You must choose a provider before you can choose a model:
 > /model <model-name>
 ```
 
-Once both are set, the prompt shows your selection, for example `> [ openai / gpt-... ]`.
+Once both are set, the line under the input shows your selection, for example
+`openai / gpt-...`, together with a badge for each setting that is on, such as
+`✓ web`. It stays in view while the model writes its reply, and leaves nothing
+behind once the reply is printed. Press ↑ to bring back something you typed earlier.
 
 ## 6. Send your first message
 
@@ -176,7 +179,29 @@ sandbox, because it can change that code.
 | `/help`                | Show each command and what it does                    |
 | `/web`                 | Turn web search for the model on or off               |
 | `/max-tokens <tokens>` | Limit the reply length in tokens; no number resets it |
+| `/set-default`         | Start with the current model and web search           |
 | `exit` or `Ctrl+C`     | Quit the CLI                                          |
+
+Commands are completed as you type: type `/` and a menu of the commands opens above
+the input. After `/provider ` it lists the providers, and after `/model ` the models of
+the selected provider, in whatever case you type them. Pick one with **Tab** or the
+arrow keys and press **Enter**: a command that needs a name then lists the choices for
+it, and other commands run straight away. **Esc** closes the menu. If you haven't
+picked anything, Enter sends what you typed.
+
+### Starting with your usual model
+
+Select a provider and model, turn `/web` on or off, and type `/set-default`. From then
+on, the CLI starts with those settings. They're saved in
+`~/.config/tandemone/defaults.json`; run `/set-default` again to change them, or
+delete the file to start with nothing selected.
+
+The defaults are applied once the available models are loaded. If your default model
+isn't available any more, no provider or model is selected and the CLI says so; web
+search is still applied.
+
+`/max-tokens` isn't saved, because a limit that suits one model can be more than
+another supports. Set it again in each session where you need it.
 
 ## Troubleshooting
 

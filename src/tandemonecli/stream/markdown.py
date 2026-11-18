@@ -69,14 +69,15 @@ def _closes_fence(line: str, fence: str) -> bool:
 class _LastLines:
     """Shows only the last lines of a renderable that fit on the screen."""
 
-    def __init__(self, renderable: RenderableType):
+    def __init__(self, renderable: RenderableType, spare_lines: int = _SPARE_LINES):
         self.renderable = renderable
+        self.spare_lines = spare_lines
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
         lines = console.render_lines(self.renderable, options, pad=False)
-        max_lines = max(console.size.height - _SPARE_LINES, 1)
+        max_lines = max(console.size.height - self.spare_lines, 1)
         new_line = Segment.line()
         for line in lines[-max_lines:]:
             yield from line
@@ -88,12 +89,16 @@ class MarkdownPrinter:
 
     Call ``add`` for each chunk of text and ``finish`` at the end, also when the
     stream fails, so the rest is printed and the terminal is left in order.
+    ``reserved_lines`` at the bottom of the terminal are left free for other
+    output, such as a footer pinned there.
     Terminal control characters are removed, and links show their address, so the
     reply can't control the terminal or hide where a link goes.
     """
 
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, reserved_lines: int = 0):
         self.console = console
+        # Lines at the bottom the block being written must stay out of
+        self.reserved_lines = reserved_lines
         self._pending = ""
         self._printed = False
         self._live: Live | None = None
@@ -146,4 +151,5 @@ class MarkdownPrinter:
                 transient=True,
             )
             self._live.start()
-        self._live.update(_LastLines(self._render(self._pending)))
+        spare_lines = _SPARE_LINES + self.reserved_lines
+        self._live.update(_LastLines(self._render(self._pending), spare_lines))

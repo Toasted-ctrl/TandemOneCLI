@@ -189,6 +189,29 @@ def test_finished_blocks_are_printed_above_the_live_block():
     assert "Writing" in raw
 
 
+def rendered_live(printer: MarkdownPrinter, console: Console) -> list[str]:
+    """The lines of the block being written, as plain text."""
+    assert printer._live is not None
+    return [
+        "".join(segment.text for segment in line).rstrip()
+        for line in console.render_lines(printer._live.renderable, pad=False)
+    ]
+
+
+def test_block_being_written_stays_out_of_reserved_lines():
+    console = terminal_console(height=12)
+    printer = MarkdownPrinter(console, reserved_lines=4)
+    code = "\n".join(f"line {n}" for n in range(30))
+
+    printer.add(f"```\n{code}")
+
+    # The spare lines and the reserved ones (for a pinned footer, say) stay free
+    lines = rendered_live(printer, console)
+    assert len(lines) <= 12 - 2 - 4
+    assert "line 29" in "\n".join(lines)
+    printer.finish()
+
+
 def test_tall_live_block_shows_its_last_lines():
     console = terminal_console(height=6)
     printer = MarkdownPrinter(console)
